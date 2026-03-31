@@ -17,8 +17,13 @@ from .config import (
     A_STAR_INFLATION_MARGIN,
     A_STAR_LOOKAHEAD_STEPS,
     A_STAR_REPLAN_SECONDS,
+    AUTO_EXPLORE_REPLAN_SECONDS,
+    AUTO_FRONTIER_MIN_COMPONENT_CELLS,
+    AUTO_GLOBAL_FRONTIER_FALLBACK,
+    AUTO_PARTITION_EPSILON_METERS,
     COLOR_BOUNDARY,
     COLOR_OBSTACLE,
+    DEFAULT_MISSION_MODE,
     DRONE_NAMES,
     DRONE_START_POSE,
     DRONE_START_SPACING,
@@ -29,12 +34,12 @@ from .config import (
     OBSTACLE_AVOID_DISTANCE,
     OBSTACLE_TURN_GAIN,
     PATH_LINE_WIDTH,
-    PLANNING_MAP_MODE,
     PREDICTION_NOISE,
     RANDOM_SEED,
     RAY_ALPHA,
     RAY_LINE_WIDTH,
     SHOW_ASTAR_LOCAL_GRID,
+    SHOW_PARTITION_OVERLAY_BY_DEFAULT,
     SHOW_VISION_RAYS,
     START_SIMULATION_RUNNING,
     STUCK_PROGRESS_EPS,
@@ -51,6 +56,14 @@ from .config import (
     WORLD_WIDTH_METERS,
 )
 from .environment import empty_target_sequences, generate_environment, square_contains_point
+from .auto_explore import (
+    choose_frontier_goal_for_robot,
+    compute_partition_centroids,
+    compute_partition_labels,
+    connected_components,
+    frontier_mask,
+    partition_generators_from_positions,
+)
 from .landmark import Landmark
 from .localization import OdometryEstimator
 from .mapping_utils import apply_scan_to_grid, clearance_groups, reveal_start_area, update_known_map_from_scan
@@ -84,6 +97,14 @@ class Simulator:
         self.ny = self.planner.ny
         self.truth_occupancy = self._build_truth_occupancy_grid()
         self.shared_known_grid = self._init_known_grid()
+        self.mission_mode = DEFAULT_MISSION_MODE
+        self.show_partition_overlay = SHOW_PARTITION_OVERLAY_BY_DEFAULT
+        self.partition_labels = -np.ones((self.ny, self.nx), dtype=int)
+        self.partition_rgba = np.zeros((self.ny, self.nx, 4), dtype=float)
+        self.partition_generators_xy = np.zeros((0, 2), dtype=float)
+        self.partition_centroids_xy = np.zeros((0, 2), dtype=float)
+        self.partition_generator_colors = []
+        self.frontier_components = []
 
         self.selected_drone_index = 0
         self.edit_mode = 'add_waypoint'
@@ -122,13 +143,38 @@ class Simulator:
             for i in range(len(self.drones))
         ]
         self.ax.legend(handles=legend_handles, loc='upper left')
+        self._sync_paths_for_mode()
+        self._refresh_partition_state()
         self.ui.refresh_all()
 
     def _refresh_toggle_button(self):
         self.ui.refresh_toggle_button()
 
+    def _refresh_partition_button(self):
+        self.ui.refresh_partition_button()
+
     def _refresh_control_text(self):
         self.ui.refresh_status_text()
+
+    def _sync_paths_for_mode(self):
+        for drone in getattr(self, 'drones', []):
+            if self.mission_mode == 'manual_click':
+                drone['path'] = list(drone.get('manual_path', []))
+                drone['current_target_index'] = min(drone.get('current_target_index', 0), len(drone['path']))
+                drone['auto_goal_xy'] = None
+                drone['auto_goal_last_set_time'] = -1e9
+            else:
+                drone['path'] = [] if drone.get('auto_goal_xy') is None else [tuple(drone['auto_goal_xy'])]
+                drone['current_target_index'] = 0
+            self._update_mission_artist(drone)
+
+    def on_select_mission_mode(self, label):
+        norm = str(label).strip().lower()
+        self.mission_mode = 'auto_explore' if 'auto' in norm else 'manual_click'
+        self._sync_paths_for_mode()
+        self._refresh_control_text()
+        self._refresh_partition_state()
+        self.fig.canvas.draw_idle()
 
     def on_select_robot(self, label):
         try:
@@ -142,6 +188,12 @@ class Simulator:
         norm = str(label).strip().lower()
         self.edit_mode = 'set_start' if 'start' in norm else 'add_waypoint'
         self._refresh_control_text()
+
+    def toggle_partition_overlay(self, event=None):
+        self.show_partition_overlay = not self.show_partition_overlay
+        self._refresh_partition_button()
+        self.ui.refresh_partition_overlay()
+        self.fig.canvas.draw_idle()
 
     def _toolbar_active(self):
         toolbar = getattr(self.fig.canvas, 'toolbar', None)
@@ -161,15 +213,56 @@ class Simulator:
         return True
 
     def _set_drone_start(self, drone, x, y):
+        robot = drone['robot']
         _, _, angle = drone['odometry'].mu
-        self._reset_drone_state(
-            drone,
-            float(x),
-            float(y),
-            float(angle),
-            reset_local_grid=False,
-            discovered_flag=True,
+        robot.x = float(x)
+        robot.y = float(y)
+        robot.angle = float(angle)
+        robot.left_motor_speed = 0.0
+        robot.right_motor_speed = 0.0
+
+        drone['odometry'].mu = np.array([x, y, angle], dtype=float)
+        drone['odometry'].cov = np.diag([0.1, 0.1, 1.0])
+        drone['current_target_index'] = 0
+        drone['auto_goal_xy'] = None
+        drone['auto_goal_last_set_time'] = -1e9
+        drone['planned_path'] = [(x, y)]
+        drone['plan_goal_index'] = -1
+        drone['last_plan_time'] = -1e9
+        drone['path_progress_index'] = 0
+        drone['plan_line'].set_data([x], [y])
+        drone['subgoal_marker'].set_data([x] if drone['path'] else [], [y] if drone['path'] else [])
+        self._reveal_start_area(drone['local_known_grid'], x, y)
+        self._reveal_start_area(self.shared_known_grid, x, y)
+        drone['trace_x'] = [x]
+        drone['trace_y'] = [y]
+        drone['est_trace_x'] = [x]
+        drone['est_trace_y'] = [y]
+        drone['trace_line'].set_data(drone['trace_x'], drone['trace_y'])
+        drone['est_trace_line'].set_data(drone['est_trace_x'], drone['est_trace_y'])
+        drone['recent_positions'] = [(self.time_elapsed, x, y)]
+        drone['just_discovered_obstacle'] = True
+        drone['last_command_active'] = False
+        self._update_mission_artist(drone)
+        drone['true_patch'].set_xy(self.robot_shape_from_pose(x, y, angle, robot.size))
+        drone['est_patch'].set_xy(self.robot_shape_from_pose(x, y, angle, robot.size * 0.92))
+        if drone['ellipse_patch'] is not None:
+            drone['ellipse_patch'].remove()
+        drone['ellipse_patch'] = drone['odometry'].draw_uncertainty_ellipse(
+            self.ax,
+            n_std=2.5,
+            edgecolor=drone['color'],
+            facecolor='none',
+            linewidth=1.4,
+            linestyle=':',
+            alpha=0.9,
         )
+        drone['fov_patch'].remove()
+        drone['fov_patch'] = self._make_fov_patch(x, y, angle, drone['color'])
+        self.ax.add_patch(drone['fov_patch'])
+        for line in drone['ray_lines']:
+            line.set_data([x, x], [y, y])
+        self._refresh_partition_state()
 
     def on_map_click(self, event):
         if event.inaxes != self.ax or event.button != 1:
@@ -189,7 +282,10 @@ class Simulator:
                 self._refresh_toggle_button()
             self._set_drone_start(drone, float(x), float(y))
         else:
-            drone['path'].append((float(x), float(y)))
+            if self.mission_mode != 'manual_click':
+                return
+            drone['manual_path'].append((float(x), float(y)))
+            drone['path'] = list(drone['manual_path'])
             if len(drone['path']) == 1:
                 drone['current_target_index'] = 0
             self._update_mission_artist(drone)
@@ -219,6 +315,9 @@ class Simulator:
             return
         drone = self.drones[self.selected_drone_index]
         x_est, y_est, _ = drone['odometry'].mu
+        drone['manual_path'] = []
+        drone['auto_goal_xy'] = None
+        drone['auto_goal_last_set_time'] = -1e9
         drone['path'] = []
         drone['current_target_index'] = 0
         drone['planned_path'] = [(x_est, y_est)]
@@ -228,7 +327,9 @@ class Simulator:
         drone['plan_line'].set_data([x_est], [y_est])
         drone['subgoal_marker'].set_data([], [])
         self._update_mission_artist(drone)
+        self._refresh_partition_state()
         self.ui.refresh_shared_map()
+        self._refresh_partition_state()
         self.fig.canvas.draw_idle()
 
     def _save_trajectory_png(self, ts=None):
@@ -334,17 +435,74 @@ class Simulator:
     def _planning_occupancy(self, known_grid):
         return self.planner.planning_occupancy(known_grid, OCCUPIED)
 
-    def _known_grid_for_planning(self, drone):
-        mode = str(PLANNING_MAP_MODE).strip().lower()
-        if mode == 'local':
-            return drone['local_known_grid']
-        if mode == 'fused':
-            return np.maximum(self.shared_known_grid, drone['local_known_grid'])
-        return self.shared_known_grid
-
     def _world_to_grid(self, x, y):
         return self.planner.world_to_grid(x, y)
 
+    def _grid_to_world(self, cell):
+        return self.planner.grid_to_world(cell)
+
+    def _generator_positions(self):
+        est_positions = []
+        for drone in self.drones:
+            x_est, y_est, _ = drone['odometry'].mu
+            est_positions.append((x_est, y_est))
+        return partition_generators_from_positions(est_positions, DRONE_START_POSE, epsilon_m=AUTO_PARTITION_EPSILON_METERS)
+
+    def _refresh_partition_state(self):
+        if not getattr(self, 'drones', None):
+            return
+        generators = self._generator_positions()
+        blocked = self.shared_known_grid == OCCUPIED
+        self.partition_labels = compute_partition_labels((self.ny, self.nx), self._grid_to_world, generators, blocked_mask=blocked)
+        self.partition_centroids_xy = compute_partition_centroids(self.partition_labels, self._grid_to_world)
+        self.partition_generators_xy = np.asarray(generators, dtype=float)
+        self.partition_generator_colors = [drone['color'] for drone in self.drones]
+        rgba = np.zeros((self.ny, self.nx, 4), dtype=float)
+        for idx, drone in enumerate(self.drones):
+            if idx >= len(self.partition_generator_colors):
+                break
+            mask = self.partition_labels == idx
+            rgba[mask, :3] = np.array(drone['color'][:3])
+            rgba[mask, 3] = 0.12
+        rgba[self.shared_known_grid == OCCUPIED, 3] = 0.0
+        self.partition_rgba = rgba
+        self.frontier_components = connected_components(
+            frontier_mask(self.shared_known_grid, UNKNOWN, FREE),
+            min_cells=AUTO_FRONTIER_MIN_COMPONENT_CELLS,
+        )
+
+    def _ensure_auto_goal(self, drone):
+        if self.mission_mode != 'auto_explore':
+            return
+        self._refresh_partition_state()
+        x_est, y_est, _ = drone['odometry'].mu
+        need_goal = False
+        if drone.get('auto_goal_xy') is None:
+            need_goal = True
+        elif (self.time_elapsed - drone.get('auto_goal_last_set_time', -1e9)) >= AUTO_EXPLORE_REPLAN_SECONDS:
+            need_goal = True
+        elif drone.get('just_discovered_obstacle', False):
+            need_goal = True
+        elif not drone.get('path'):
+            need_goal = True
+        if not need_goal:
+            return
+        goal_xy, _meta = choose_frontier_goal_for_robot(
+            drone['drone_index'],
+            self.frontier_components,
+            self.partition_labels,
+            self._grid_to_world,
+            (x_est, y_est),
+            fallback_global=AUTO_GLOBAL_FRONTIER_FALLBACK,
+        )
+        drone['auto_goal_xy'] = None if goal_xy is None else tuple(goal_xy)
+        drone['auto_goal_last_set_time'] = self.time_elapsed
+        drone['current_target_index'] = 0
+        drone['path'] = [] if goal_xy is None else [tuple(goal_xy)]
+        drone['plan_goal_index'] = -1
+        drone['last_plan_time'] = -1e9
+        drone['planned_path'] = [(x_est, y_est)] if goal_xy is not None else []
+        self._update_mission_artist(drone)
 
     def _astar(self, start_xy, goal_xy, known_grid):
         return self.planner.astar(start_xy, goal_xy, known_grid, OCCUPIED)
@@ -390,7 +548,7 @@ class Simulator:
         y0 = max(0, cy - window)
         y1 = min(self.ny - 1, cy + window)
 
-        known = self._known_grid_for_planning(drone)
+        known = self.shared_known_grid
         planning_occ = self._planning_occupancy(known)
         path_cells = {self._world_to_grid(px, py) for px, py in drone.get('planned_path', [])}
         color = drone['color']
@@ -505,8 +663,11 @@ class Simulator:
             'drone_index': drone_index,
             'rng': np.random.default_rng(self._seed_for_drone(drone_index, stream=2)),
             'color': color,
+            'manual_path': list(path),
             'path': list(path),
             'current_target_index': 0,
+            'auto_goal_xy': None,
+            'auto_goal_last_set_time': -1e9,
             'robot': robot,
             'odometry': odometry,
             'true_patch': true_patch,
@@ -569,92 +730,6 @@ class Simulator:
             zorder=1,
         )
 
-    def _sync_uncertainty_patch(self, drone):
-        drone['ellipse_patch'] = drone['odometry'].draw_uncertainty_ellipse(
-            self.ax,
-            n_std=2.5,
-            ellipse=drone.get('ellipse_patch'),
-            edgecolor=drone['color'],
-            facecolor='none',
-            linewidth=1.4,
-            linestyle=':',
-            alpha=0.9,
-        )
-
-    def _sync_fov_patch(self, drone, x, y, angle_deg):
-        patch = drone.get('fov_patch')
-        if patch is None:
-            patch = self._make_fov_patch(x, y, angle_deg, drone['color'])
-            self.ax.add_patch(patch)
-            drone['fov_patch'] = patch
-            return
-        patch.center = (x, y)
-        patch.theta1 = angle_deg - self.fov_angle / 2.0
-        patch.theta2 = angle_deg + self.fov_angle / 2.0
-        patch.r = self.view_distance
-        patch.set_facecolor(drone['color'])
-        patch.set_edgecolor(drone['color'])
-        patch.set_alpha(0.10)
-
-    def _reset_drone_state(self, drone, x, y, angle, *, path=None, reset_local_grid=False, discovered_flag=False):
-        robot = drone['robot']
-        robot.x = float(x)
-        robot.y = float(y)
-        robot.angle = float(angle)
-        robot.left_motor_speed = 0.0
-        robot.right_motor_speed = 0.0
-
-        drone['odometry'].mu = np.array([x, y, angle], dtype=float)
-        drone['odometry'].cov = np.diag([0.1, 0.1, 1.0])
-
-        if path is not None:
-            drone['path'] = list(path)
-        drone['current_target_index'] = 0
-        drone['min_clearance'] = self.view_distance
-        drone['planned_path'] = [(x, y)]
-        drone['plan_goal_index'] = -1
-        drone['last_plan_time'] = -1e9
-        drone['path_progress_index'] = 0
-        drone['plan_line'].set_data([x], [y])
-
-        if drone['path']:
-            drone['subgoal_marker'].set_data([x], [y])
-            drone['target_marker'].set_data([drone['path'][0][0]], [drone['path'][0][1]])
-        else:
-            drone['subgoal_marker'].set_data([], [])
-            drone['target_marker'].set_data([], [])
-
-        if reset_local_grid:
-            drone['local_known_grid'] = self._init_known_grid()
-        self._reveal_start_area(drone['local_known_grid'], x, y)
-        self._reveal_start_area(self.shared_known_grid, x, y)
-        drone['known_occ_count'] = int(np.count_nonzero(self.shared_known_grid == OCCUPIED))
-        drone['local_known_occ_count'] = int(np.count_nonzero(drone['local_known_grid'] == OCCUPIED))
-        drone['just_discovered_obstacle'] = bool(discovered_flag)
-
-        drone['recent_positions'] = [(self.time_elapsed, x, y)]
-        drone['recovery_until'] = -1e9
-        drone['recovery_turn_sign'] = 1.0
-        drone['last_scan_bias'] = 1.0
-        drone['last_command_active'] = False
-        drone['stuck_events'] = 0
-
-        drone['trace_x'] = [x]
-        drone['trace_y'] = [y]
-        drone['est_trace_x'] = [x]
-        drone['est_trace_y'] = [y]
-        drone['trace_line'].set_data(drone['trace_x'], drone['trace_y'])
-        drone['est_trace_line'].set_data(drone['est_trace_x'], drone['est_trace_y'])
-
-        self._clear_local_grid_patches(drone)
-        drone['true_patch'].set_xy(self.robot_shape_from_pose(x, y, angle, robot.size))
-        drone['est_patch'].set_xy(self.robot_shape_from_pose(x, y, angle, robot.size * 0.92))
-        self._sync_uncertainty_patch(drone)
-        self._sync_fov_patch(drone, x, y, angle)
-        for line in drone['ray_lines']:
-            line.set_data([x, x], [y, y])
-        self._update_mission_artist(drone)
-
     def _reveal_start_area(self, grid, x, y, radius_m=1.1):
         offsets = self._offsets_for_margin(radius_m)
         gx, gy = self._world_to_grid(x, y)
@@ -676,7 +751,10 @@ class Simulator:
         self._refresh_control_text()
         for idx, drone in enumerate(self.drones):
             new_path = list(self.generated_target_sequences[idx]) if idx < len(self.generated_target_sequences) else []
-            drone['path'] = new_path
+            drone['manual_path'] = new_path
+            drone['path'] = list(new_path) if self.mission_mode == 'manual_click' else []
+            drone['auto_goal_xy'] = None
+            drone['auto_goal_last_set_time'] = -1e9
         self.reset_simulation()
         self.ui.refresh_shared_map()
 
@@ -684,6 +762,7 @@ class Simulator:
         self.auto_mode = not self.auto_mode
         self._refresh_toggle_button()
         self._refresh_control_text()
+        self._refresh_partition_state()
         if not self.auto_mode:
             for drone in self.drones:
                 drone['robot'].set_motor_speeds(0.0, 0.0)
@@ -699,24 +778,85 @@ class Simulator:
 
         for idx, drone in enumerate(self.drones):
             start_x, start_y, start_angle = self._start_pose_for_index(idx, len(self.drones))
-            path = list(self.generated_target_sequences[idx]) if idx < len(self.generated_target_sequences) else []
-            drone['robot'].rng = np.random.default_rng(self._seed_for_drone(idx, stream=1))
+            drone['manual_path'] = list(self.generated_target_sequences[idx]) if idx < len(self.generated_target_sequences) else []
+            drone['path'] = list(drone['manual_path']) if self.mission_mode == 'manual_click' else []
+            drone['auto_goal_xy'] = None
+            drone['auto_goal_last_set_time'] = -1e9
+            robot = drone['robot']
+            robot.rng = np.random.default_rng(self._seed_for_drone(idx, stream=1))
             drone['rng'] = np.random.default_rng(self._seed_for_drone(idx, stream=2))
-            self._reset_drone_state(
-                drone,
-                start_x,
-                start_y,
-                start_angle,
-                path=path,
-                reset_local_grid=True,
-                discovered_flag=False,
+            robot.x = start_x
+            robot.y = start_y
+            robot.angle = start_angle
+            robot.left_motor_speed = 0.0
+            robot.right_motor_speed = 0.0
+
+            drone['odometry'].mu = np.array([start_x, start_y, start_angle], dtype=float)
+            drone['odometry'].cov = np.diag([0.1, 0.1, 1.0])
+            drone['current_target_index'] = 0
+            drone['min_clearance'] = self.view_distance
+            drone['planned_path'] = [(start_x, start_y)]
+            drone['plan_goal_index'] = -1
+            drone['last_plan_time'] = -1e9
+            drone['path_progress_index'] = 0
+            drone['plan_line'].set_data([start_x], [start_y])
+            if drone['path']:
+                drone['subgoal_marker'].set_data([start_x], [start_y])
+            else:
+                drone['subgoal_marker'].set_data([], [])
+            if drone['path']:
+                drone['target_marker'].set_data([drone['path'][0][0]], [drone['path'][0][1]])
+            else:
+                drone['target_marker'].set_data([], [])
+            drone['local_known_grid'] = self._init_known_grid()
+            self._reveal_start_area(drone['local_known_grid'], start_x, start_y)
+            self._reveal_start_area(self.shared_known_grid, start_x, start_y)
+            drone['known_occ_count'] = int(np.count_nonzero(self.shared_known_grid == OCCUPIED))
+            drone['local_known_occ_count'] = int(np.count_nonzero(drone['local_known_grid'] == OCCUPIED))
+            drone['just_discovered_obstacle'] = False
+            drone['recent_positions'] = [(0.0, start_x, start_y)]
+            drone['recovery_until'] = -1e9
+            drone['recovery_turn_sign'] = 1.0
+            drone['last_scan_bias'] = 1.0
+            drone['last_command_active'] = False
+            drone['stuck_events'] = 0
+
+            drone['trace_x'] = [start_x]
+            drone['trace_y'] = [start_y]
+            drone['est_trace_x'] = [start_x]
+            drone['est_trace_y'] = [start_y]
+            drone['trace_line'].set_data(drone['trace_x'], drone['trace_y'])
+            drone['est_trace_line'].set_data(drone['est_trace_x'], drone['est_trace_y'])
+
+            self._clear_local_grid_patches(drone)
+            drone['true_patch'].set_xy(self.robot_shape_from_pose(start_x, start_y, start_angle, robot.size))
+            drone['est_patch'].set_xy(self.robot_shape_from_pose(start_x, start_y, start_angle, robot.size * 0.92))
+
+            if drone['ellipse_patch'] is not None:
+                drone['ellipse_patch'].remove()
+            drone['ellipse_patch'] = drone['odometry'].draw_uncertainty_ellipse(
+                self.ax,
+                n_std=2.5,
+                edgecolor=drone['color'],
+                facecolor='none',
+                linewidth=1.4,
+                linestyle=':',
+                alpha=0.9,
             )
+
+            drone['fov_patch'].remove()
+            drone['fov_patch'] = self._make_fov_patch(start_x, start_y, start_angle, drone['color'])
+            self.ax.add_patch(drone['fov_patch'])
+
+            for line in drone['ray_lines']:
+                line.set_data([start_x, start_x], [start_y, start_y])
+            self._update_mission_artist(drone)
 
         self.ui.refresh_shared_map()
 
-    def _apply_scan_to_grid(self, grid, pose, scan):
+    def _apply_scan_to_grid(self, grid, robot, scan):
         apply_scan_to_grid(
-            grid, pose, scan, self._world_to_grid, self._stamp_obstacle_hit, self.grid_resolution, self.view_distance, UNKNOWN, FREE
+            grid, robot, scan, self._world_to_grid, self._stamp_obstacle_hit, self.grid_resolution, self.view_distance, UNKNOWN, FREE
         )
 
     def _update_known_map_from_scan(self, drone, scan):
@@ -739,8 +879,7 @@ class Simulator:
 
         x_est, y_est, _ = drone['odometry'].mu
         goal = path[target_idx]
-        known_grid = self._known_grid_for_planning(drone)
-        planning_occ = self._planning_occupancy(known_grid)
+        planning_occ = self._planning_occupancy(self.shared_known_grid)
         need_replan = False
         if drone['plan_goal_index'] != target_idx:
             need_replan = True
@@ -757,7 +896,7 @@ class Simulator:
 
         if need_replan:
             old_path = list(drone['planned_path'])
-            new_path = self._astar((x_est, y_est), goal, known_grid)
+            new_path = self._astar((x_est, y_est), goal, self.shared_known_grid)
             drone['plan_goal_index'] = target_idx
             drone['last_plan_time'] = self.time_elapsed
 
@@ -781,7 +920,7 @@ class Simulator:
             return None
         x_est, y_est, _ = drone['odometry'].mu
         prog = drone['path_progress_index']
-        planning_occ = self._planning_occupancy(self._known_grid_for_planning(drone))
+        planning_occ = self._planning_occupancy(self.shared_known_grid)
 
         while prog < len(path_pts) - 1 and math.hypot(path_pts[prog][0] - x_est, path_pts[prog][1] - y_est) < A_STAR_GOAL_TOLERANCE:
             prog += 1
@@ -832,8 +971,6 @@ class Simulator:
     def _compute_control(self, drone):
         robot = drone['robot']
         odometry = drone['odometry']
-        path = drone['path']
-        target_idx = drone['current_target_index']
         L = robot.motor_distance
 
         scan = robot.scan_obstacles(self.obstacles, self.fov_angle, self.view_distance, ray_count=VISION_RAY_COUNT)
@@ -848,6 +985,11 @@ class Simulator:
         if drone['ray_lines']:
             for ray_info, line in zip(scan, drone['ray_lines']):
                 line.set_data([robot.x, ray_info['hit_x']], [robot.y, ray_info['hit_y']])
+
+        if self.mission_mode == 'auto_explore':
+            self._ensure_auto_goal(drone)
+        path = drone['path']
+        target_idx = drone['current_target_index']
 
         if not path or target_idx >= len(path):
             drone['plan_line'].set_data([], [])
@@ -874,12 +1016,22 @@ class Simulator:
         dist_sub = math.hypot(sg_x - x_est, sg_y - y_est)
 
         if dist_goal < A_STAR_GOAL_TOLERANCE:
-            drone['current_target_index'] += 1
-            if drone['current_target_index'] >= len(path):
+            if self.mission_mode == 'auto_explore':
+                drone['auto_goal_xy'] = None
+                drone['auto_goal_last_set_time'] = self.time_elapsed
+                drone['path'] = []
+                drone['current_target_index'] = 0
                 drone['target_marker'].set_data([], [])
                 drone['subgoal_marker'].set_data([], [])
                 drone['planned_path'] = []
                 drone['plan_line'].set_data([], [])
+            else:
+                drone['current_target_index'] += 1
+                if drone['current_target_index'] >= len(path):
+                    drone['target_marker'].set_data([], [])
+                    drone['subgoal_marker'].set_data([], [])
+                    drone['planned_path'] = []
+                    drone['plan_line'].set_data([], [])
             drone['plan_goal_index'] = -1
             drone['last_command_active'] = False
             self._update_mission_artist(drone)
@@ -961,8 +1113,21 @@ class Simulator:
         drone['true_patch'].set_xy(self.robot_shape_from_pose(robot.x, robot.y, robot.angle, robot.size))
         drone['est_patch'].set_xy(self.robot_shape_from_pose(est_x, est_y, est_theta, robot.size * 0.92))
 
-        self._sync_uncertainty_patch(drone)
-        self._sync_fov_patch(drone, robot.x, robot.y, robot.angle)
+        if drone['ellipse_patch'] is not None:
+            drone['ellipse_patch'].remove()
+        drone['ellipse_patch'] = odometry.draw_uncertainty_ellipse(
+            self.ax,
+            n_std=2.5,
+            edgecolor=drone['color'],
+            facecolor='none',
+            linewidth=1.4,
+            linestyle=':',
+            alpha=0.9,
+        )
+
+        drone['fov_patch'].remove()
+        drone['fov_patch'] = self._make_fov_patch(robot.x, robot.y, robot.angle, drone['color'])
+        self.ax.add_patch(drone['fov_patch'])
         self._update_local_grid_visual(drone)
 
         return detected
@@ -1003,13 +1168,21 @@ class Simulator:
 
         if dt > 0.0:
             self.trace_counter += 1
+        self._refresh_partition_state()
         self.ui.refresh_status_text()
         self.ui.refresh_shared_map()
+        self.ui.refresh_partition_overlay()
         artists.append(self.ui.status_text)
         if self.ui.shared_map_image is not None:
             artists.append(self.ui.shared_map_image)
         if self.ui.shared_robot_scatter is not None:
             artists.append(self.ui.shared_robot_scatter)
+        if self.ui.partition_image is not None:
+            artists.append(self.ui.partition_image)
+        if self.ui.partition_generator_scatter is not None:
+            artists.append(self.ui.partition_generator_scatter)
+        if self.ui.partition_centroid_scatter is not None:
+            artists.append(self.ui.partition_centroid_scatter)
         return artists
 
     def run(self):

@@ -38,12 +38,6 @@ A_STAR_GRID_PATH_ALPHA = 0.20
 A_STAR_GRID_UPDATE_FRAMES = 4
 A_STAR_GRID_MAX_DRONES = 1
 
-# Which map each robot uses for planning:
-#   'shared' -> cooperative shared map from all robots
-#   'local'  -> only that robot's own observations
-#   'fused'  -> union of local + shared (same as shared for occupancy, but explicit)
-PLANNING_MAP_MODE = 'shared'
-
 # Vision-ray styling.
 RAY_LINE_WIDTH = 1.3
 RAY_ALPHA = 0.55
@@ -74,6 +68,16 @@ START_SIMULATION_RUNNING = False
 OUTPUT_FOLDER_NAME = "outputs"
 
 # ------------------------------
+# Automatic exploration / partition
+# ------------------------------
+DEFAULT_MISSION_MODE = 'manual_click'   # 'manual_click' or 'auto_explore'
+SHOW_PARTITION_OVERLAY_BY_DEFAULT = True
+AUTO_EXPLORE_REPLAN_SECONDS = 1.0
+AUTO_FRONTIER_MIN_COMPONENT_CELLS = 2
+AUTO_PARTITION_EPSILON_METERS = 0.45
+AUTO_GLOBAL_FRONTIER_FALLBACK = True
+
+# ------------------------------
 # Random environment generation
 # ------------------------------
 OBSTACLE_COUNT = 8
@@ -94,4 +98,3 @@ COLOR_FREE = '#f8fbff'
 COLOR_OCCUPIED = '#5b6470'
 COLOR_OBSTACLE = '#5A5A5A'
 COLOR_BOUNDARY = 'red'
-

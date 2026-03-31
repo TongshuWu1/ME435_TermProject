@@ -10,8 +10,8 @@ class GridPlanner:
     def __init__(self, grid_resolution, inflation_margin):
         self.grid_resolution = float(grid_resolution)
         self.inflation_margin = float(inflation_margin)
-        self.nx = int(math.ceil(WORLD_WIDTH_METERS / self.grid_resolution))
-        self.ny = int(math.ceil(WORLD_HEIGHT_METERS / self.grid_resolution))
+        self.nx = int(round(WORLD_WIDTH_METERS / self.grid_resolution))
+        self.ny = int(round(WORLD_HEIGHT_METERS / self.grid_resolution))
         self.planning_inflation_offsets = self.offsets_for_margin(self.inflation_margin)
         self.hit_stamp_offsets = self.offsets_for_margin(max(0.55, 0.7 * self.inflation_margin))
 
@@ -25,8 +25,8 @@ class GridPlanner:
         return offsets
 
     def world_to_grid(self, x, y):
-        gx = int(np.clip(math.floor(float(x) / self.grid_resolution), 0, self.nx - 1))
-        gy = int(np.clip(math.floor(float(y) / self.grid_resolution), 0, self.ny - 1))
+        gx = int(np.clip(round((x - 0.5 * self.grid_resolution) / self.grid_resolution), 0, self.nx - 1))
+        gy = int(np.clip(round((y - 0.5 * self.grid_resolution) / self.grid_resolution), 0, self.ny - 1))
         return gx, gy
 
     def grid_to_world(self, cell):

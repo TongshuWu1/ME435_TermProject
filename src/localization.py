@@ -52,6 +52,7 @@ class OdometryEstimator:
         theta_deg = self.mu[2]
         theta_rad = np.deg2rad(theta_deg)
 
+        # State prediction
         dx = v * np.cos(theta_rad) * dt
         dy = v * np.sin(theta_rad) * dt
         dtheta_deg = np.rad2deg(omega * dt)
@@ -59,6 +60,7 @@ class OdometryEstimator:
         self.mu = self.mu + np.array([dx, dy, dtheta_deg], dtype=float)
         self.mu[2] = self._wrap_angle_deg(self.mu[2])
 
+        # Since heading is stored in DEGREES, derivative wrt heading includes pi/180
         deg_to_rad = np.pi / 180.0
         G = np.array([
             [1.0, 0.0, -v * np.sin(theta_rad) * dt * deg_to_rad],
@@ -69,6 +71,7 @@ class OdometryEstimator:
         motion_noise_cov = np.asarray(motion_noise_cov, dtype=float)
 
         if motion_noise_cov.shape == (2, 2):
+            # Control-space noise M for [v, omega(rad/s)]
             V = np.array([
                 [np.cos(theta_rad) * dt, 0.0],
                 [np.sin(theta_rad) * dt, 0.0],
@@ -77,6 +80,7 @@ class OdometryEstimator:
             Q = V @ motion_noise_cov @ V.T
 
         elif motion_noise_cov.shape == (3, 3):
+            # Local/body-frame motion covariance over [forward_x, lateral_y, heading_deg]
             R_theta = np.array([
                 [np.cos(theta_rad), -np.sin(theta_rad), 0.0],
                 [np.sin(theta_rad),  np.cos(theta_rad), 0.0],
@@ -116,6 +120,7 @@ class OdometryEstimator:
         if alpha <= 0.0:
             return
 
+        # Softer updates via noise inflation, instead of shrinking covariance too much
         R_eff = R / alpha
 
         I = np.eye(3)
@@ -150,11 +155,15 @@ class OdometryEstimator:
             self.mu = self.mu + K @ y
             self.mu[2] = self._wrap_angle_deg(self.mu[2])
 
+            # Joseph-form covariance update
             KH = K @ H
             self.cov = (I - KH) @ self.cov @ (I - KH).T + K @ R_eff @ K.T
             self.cov = 0.5 * (self.cov + self.cov.T)
 
-    def ellipse_params(self, n_std=2.0):
+    def draw_uncertainty_ellipse(self, ax, n_std=2.0, **kwargs):
+        """
+        Draw and return the 2D uncertainty ellipse from the x-y covariance.
+        """
         cov_xy = self.cov[:2, :2]
         mean_xy = self.mu[:2]
 
@@ -167,32 +176,14 @@ class OdometryEstimator:
 
         angle = np.degrees(np.arctan2(eigvecs[1, 0], eigvecs[0, 0]))
         width, height = 2.0 * n_std * np.sqrt(eigvals)
-        return mean_xy, width, height, angle
 
-    def draw_uncertainty_ellipse(self, ax, n_std=2.0, ellipse=None, **kwargs):
-        """
-        Draw or update and return the 2D uncertainty ellipse from the x-y covariance.
-        """
-        mean_xy, width, height, angle = self.ellipse_params(n_std=n_std)
-
-        if ellipse is None:
-            ellipse = patches.Ellipse(
-                xy=mean_xy,
-                width=width,
-                height=height,
-                angle=angle,
-                zorder=5,
-                **kwargs,
-            )
-            ax.add_patch(ellipse)
-            return ellipse
-
-        ellipse.center = mean_xy
-        ellipse.width = width
-        ellipse.height = height
-        ellipse.angle = angle
-        for key, value in kwargs.items():
-            setter = getattr(ellipse, f'set_{key}', None)
-            if callable(setter):
-                setter(value)
+        ellipse = patches.Ellipse(
+            xy=mean_xy,
+            width=width,
+            height=height,
+            angle=angle,
+            zorder=5,
+            **kwargs,
+        )
+        ax.add_patch(ellipse)
         return ellipse
