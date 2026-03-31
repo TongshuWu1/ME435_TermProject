@@ -177,6 +177,7 @@ class Robot:
             distance = min(candidates) if candidates else view_distance
             results.append({
                 'angle_deg': ang_deg,
+                'relative_angle_deg': rel,
                 'distance': distance,
                 'hit_x': self.x + distance * dx,
                 'hit_y': self.y + distance * dy,

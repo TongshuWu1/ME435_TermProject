@@ -38,6 +38,12 @@ A_STAR_GRID_PATH_ALPHA = 0.20
 A_STAR_GRID_UPDATE_FRAMES = 4
 A_STAR_GRID_MAX_DRONES = 1
 
+# Which map each robot uses for planning:
+#   'shared' -> cooperative shared map from all robots
+#   'local'  -> only that robot's own observations
+#   'fused'  -> union of local + shared (same as shared for occupancy, but explicit)
+PLANNING_MAP_MODE = 'shared'
+
 # Vision-ray styling.
 RAY_LINE_WIDTH = 1.3
 RAY_ALPHA = 0.55
