@@ -1,9 +1,9 @@
 import math
 import random
 
-from .config import (
+from config import (
     BOUNDARY_MARGIN,
-    DRONE_NAMES,
+    ROBOT_COUNT,
     DRONE_START_POSE,
     LANDMARK_CLEARANCE,
     LANDMARK_COUNT,
@@ -86,4 +86,4 @@ def generate_environment(seed=RANDOM_SEED):
 
 
 def empty_target_sequences():
-    return [[] for _ in DRONE_NAMES]
+    return [[] for _ in range(ROBOT_COUNT)]

@@ -1,0 +1,16 @@
+{
+  "run_label": "run_001_seed_124_20260331_135521",
+  "seed": 124,
+  "mission_mode": "auto_explore",
+  "auto_policy": "weighted_coverage",
+  "robot_count": 4,
+  "robot_names": [
+    "Drone 1",
+    "Drone 2",
+    "Drone 3",
+    "Drone 4"
+  ],
+  "sim_time_seconds": 28.850000000000275,
+  "auto_mode_enabled_at_save": true,
+  "saved_at": "2026-03-31T13:56:25"
+}

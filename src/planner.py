@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 
-from .config import WORLD_HEIGHT_METERS, WORLD_WIDTH_METERS
+from config import WORLD_HEIGHT_METERS, WORLD_WIDTH_METERS
 
 
 class GridPlanner:
@@ -25,8 +25,10 @@ class GridPlanner:
         return offsets
 
     def world_to_grid(self, x, y):
-        gx = int(np.clip(round((x - 0.5 * self.grid_resolution) / self.grid_resolution), 0, self.nx - 1))
-        gy = int(np.clip(round((y - 0.5 * self.grid_resolution) / self.grid_resolution), 0, self.ny - 1))
+        gx = int(round((float(x) - 0.5 * self.grid_resolution) / self.grid_resolution))
+        gy = int(round((float(y) - 0.5 * self.grid_resolution) / self.grid_resolution))
+        gx = 0 if gx < 0 else self.nx - 1 if gx >= self.nx else gx
+        gy = 0 if gy < 0 else self.ny - 1 if gy >= self.ny else gy
         return gx, gy
 
     def grid_to_world(self, cell):
@@ -69,11 +71,14 @@ class GridPlanner:
         return inflated
 
     def stamp_obstacle_hit(self, known_grid, gx, gy, occupied_value):
+        changed = False
         for dx, dy in self.hit_stamp_offsets:
             nx = gx + dx
             ny = gy + dy
-            if 0 <= nx < self.nx and 0 <= ny < self.ny:
+            if 0 <= nx < self.nx and 0 <= ny < self.ny and known_grid[ny, nx] != occupied_value:
                 known_grid[ny, nx] = occupied_value
+                changed = True
+        return changed
 
     def planning_occupancy(self, known_grid, occupied_value):
         occ_mask = known_grid == occupied_value

@@ -1,7 +1,7 @@
 import math
 import numpy as np
 
-from .config import WORLD_HEIGHT_METERS, WORLD_WIDTH_METERS
+from config import WORLD_HEIGHT_METERS, WORLD_WIDTH_METERS
 
 
 class Robot:

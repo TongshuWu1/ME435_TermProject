@@ -5,19 +5,15 @@ import numpy as np
 
 
 def frontier_mask(known_grid, unknown_value, free_value):
-    ny, nx = known_grid.shape
-    mask = np.zeros((ny, nx), dtype=bool)
-    for gy in range(1, ny - 1):
-        for gx in range(1, nx - 1):
-            if known_grid[gy, gx] != free_value:
-                continue
-            if (
-                known_grid[gy - 1, gx] == unknown_value
-                or known_grid[gy + 1, gx] == unknown_value
-                or known_grid[gy, gx - 1] == unknown_value
-                or known_grid[gy, gx + 1] == unknown_value
-            ):
-                mask[gy, gx] = True
+    mask = np.zeros_like(known_grid, dtype=bool)
+    interior = known_grid[1:-1, 1:-1] == free_value
+    adjacent_unknown = (
+        (known_grid[:-2, 1:-1] == unknown_value)
+        | (known_grid[2:, 1:-1] == unknown_value)
+        | (known_grid[1:-1, :-2] == unknown_value)
+        | (known_grid[1:-1, 2:] == unknown_value)
+    )
+    mask[1:-1, 1:-1] = interior & adjacent_unknown
     return mask
 
 
@@ -99,55 +95,227 @@ def compute_partition_centroids(labels, grid_to_world_fn):
     return np.asarray(centroids, dtype=float) if centroids else np.zeros((0, 2), dtype=float)
 
 
+def compute_density_map(
+    known_grid,
+    unknown_value,
+    free_value,
+    occupied_value,
+    frontier_weight=2.0,
+    unknown_weight=1.0,
+    free_weight=0.05,
+    smoothing_passes=0,
+):
+    frontier = frontier_mask(known_grid, unknown_value, free_value)
+    density = np.zeros_like(known_grid, dtype=float)
+    density[known_grid == free_value] = float(free_weight)
+    density[known_grid == unknown_value] = float(unknown_weight)
+    density[frontier] += float(frontier_weight)
+    density[known_grid == occupied_value] = 0.0
+
+    passes = max(0, int(smoothing_passes))
+    if passes <= 0:
+        return density
+
+    traversable = known_grid != occupied_value
+    for _ in range(passes):
+        padded = np.pad(density, 1, mode='edge')
+        padded_mask = np.pad(traversable.astype(float), 1, mode='constant', constant_values=0.0)
+        accum = np.zeros_like(density, dtype=float)
+        counts = np.zeros_like(density, dtype=float)
+        for dy in range(3):
+            for dx in range(3):
+                accum += padded[dy:dy + density.shape[0], dx:dx + density.shape[1]]
+                counts += padded_mask[dy:dy + density.shape[0], dx:dx + density.shape[1]]
+        density = np.where(counts > 0.0, accum / np.maximum(counts, 1e-9), 0.0)
+        density[~traversable] = 0.0
+    return density
+
+
+def compute_weighted_partition_centroids(labels, grid_to_world_fn, density_map):
+    centroids = []
+    for idx in range(int(labels.max()) + 1 if labels.size else 0):
+        ys, xs = np.where(labels == idx)
+        if len(xs) == 0:
+            centroids.append((np.nan, np.nan))
+            continue
+        weights = density_map[ys, xs].astype(float)
+        total_w = float(np.sum(weights))
+        if total_w <= 1e-9:
+            xsum = 0.0
+            ysum = 0.0
+            for gx, gy in zip(xs, ys):
+                xw, yw = grid_to_world_fn((int(gx), int(gy)))
+                xsum += xw
+                ysum += yw
+            centroids.append((xsum / len(xs), ysum / len(xs)))
+            continue
+        xsum = 0.0
+        ysum = 0.0
+        for gx, gy, w in zip(xs, ys, weights):
+            xw, yw = grid_to_world_fn((int(gx), int(gy)))
+            xsum += float(w) * xw
+            ysum += float(w) * yw
+        centroids.append((xsum / total_w, ysum / total_w))
+    return np.asarray(centroids, dtype=float) if centroids else np.zeros((0, 2), dtype=float)
+
+
+def _unknown_contacts(known_grid, gx, gy, unknown_value):
+    ny, nx = known_grid.shape
+    count = 0
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            nx2 = gx + dx
+            ny2 = gy + dy
+            if 0 <= nx2 < nx and 0 <= ny2 < ny and known_grid[ny2, nx2] == unknown_value:
+                count += 1
+    return count
+
+
+def _path_length(path):
+    if not path or len(path) < 2:
+        return 0.0
+    total = 0.0
+    for p0, p1 in zip(path[:-1], path[1:]):
+        total += math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+    return total
+
+
+def _teammate_penalty(xy, teammate_positions, teammate_goal_positions, radius, gain):
+    if radius <= 1e-9 or gain <= 0.0:
+        return 0.0
+    penalty = 0.0
+    inv_r2 = 1.0 / (radius * radius)
+    for source in list(teammate_positions) + list(teammate_goal_positions):
+        dx = xy[0] - source[0]
+        dy = xy[1] - source[1]
+        d2 = dx * dx + dy * dy
+        if d2 < radius * radius:
+            penalty += gain * math.exp(-1.6 * d2 * inv_r2)
+    return penalty
+
+
 def choose_frontier_goal_for_robot(
     robot_index,
     frontier_components,
     partition_labels,
     grid_to_world_fn,
     robot_xy,
+    known_grid,
+    planner,
+    occupied_value,
+    unknown_value,
     fallback_global=True,
+    teammate_positions=None,
+    teammate_goal_positions=None,
+    top_k_candidates=8,
+    info_gain=1.15,
+    partition_penalty=7.5,
+    teammate_radius=4.0,
+    teammate_penalty=2.75,
+    progress_weight=0.55,
+    min_goal_distance=0.0,
+    density_map=None,
+    centroid_xy=None,
+    centroid_weight=0.0,
+    density_value_weight=0.0,
 ):
-    best = None
-    best_score = float('inf')
-    best_meta = None
-    for cells in frontier_components:
-        assigned = 0
-        xsum = 0.0
-        ysum = 0.0
+    teammate_positions = [] if teammate_positions is None else list(teammate_positions)
+    teammate_goal_positions = [] if teammate_goal_positions is None else list(teammate_goal_positions)
+
+    quick_candidates = []
+    fallback_candidates = []
+
+    for comp_idx, cells in enumerate(frontier_components):
+        comp_size = len(cells)
+        comp_bonus = 0.2 * math.sqrt(max(comp_size, 1))
         for gx, gy in cells:
-            xw, yw = grid_to_world_fn((gx, gy))
-            xsum += xw
-            ysum += yw
-            if partition_labels[gy, gx] == robot_index:
-                assigned += 1
-        if assigned == 0 and not fallback_global:
-            continue
-        if assigned == 0:
-            continue
-        frac = assigned / max(len(cells), 1)
-        centroid = (xsum / len(cells), ysum / len(cells))
-        dist = math.hypot(centroid[0] - robot_xy[0], centroid[1] - robot_xy[1])
-        score = dist - 1.25 * frac + 0.02 * len(cells)
-        if score < best_score:
-            best_score = score
-            best = centroid
-            best_meta = {'cells': cells, 'fraction': frac, 'size': len(cells)}
-    if best is not None:
-        return best, best_meta
-    if not fallback_global:
+            xy = grid_to_world_fn((gx, gy))
+            contacts = _unknown_contacts(known_grid, gx, gy, unknown_value)
+            if contacts <= 0:
+                continue
+            in_partition = partition_labels[gy, gx] == robot_index
+            info_score = float(contacts) + comp_bonus
+            teammate_cost = _teammate_penalty(xy, teammate_positions, teammate_goal_positions, teammate_radius, teammate_penalty)
+            dist = math.hypot(xy[0] - robot_xy[0], xy[1] - robot_xy[1])
+            if dist < float(min_goal_distance):
+                continue
+            density_value = 0.0 if density_map is None else float(density_map[gy, gx])
+            centroid_cost = 0.0
+            if centroid_xy is not None and np.all(np.isfinite(np.asarray(centroid_xy, dtype=float))):
+                centroid_cost = float(centroid_weight) * math.hypot(xy[0] - float(centroid_xy[0]), xy[1] - float(centroid_xy[1]))
+            quick_score = dist - info_gain * info_score - density_value_weight * density_value + teammate_cost + centroid_cost
+            meta = {
+                'xy': xy,
+                'cell': (gx, gy),
+                'component_index': comp_idx,
+                'component_size': comp_size,
+                'unknown_contacts': contacts,
+                'info_score': info_score,
+                'in_partition': in_partition,
+                'teammate_cost': teammate_cost,
+                'euclid_dist': dist,
+                'density_value': density_value,
+                'centroid_cost': centroid_cost,
+            }
+            if in_partition:
+                quick_candidates.append((quick_score, meta))
+            elif fallback_global:
+                fallback_candidates.append((quick_score + partition_penalty, meta))
+
+    candidate_pool = quick_candidates
+    used_fallback = False
+    if not candidate_pool and fallback_global:
+        candidate_pool = fallback_candidates
+        used_fallback = True
+    if not candidate_pool and float(min_goal_distance) > 1e-9:
+        return choose_frontier_goal_for_robot(
+            robot_index,
+            frontier_components,
+            partition_labels,
+            grid_to_world_fn,
+            robot_xy,
+            known_grid,
+            planner,
+            occupied_value,
+            unknown_value,
+            fallback_global=fallback_global,
+            teammate_positions=teammate_positions,
+            teammate_goal_positions=teammate_goal_positions,
+            top_k_candidates=top_k_candidates,
+            info_gain=info_gain,
+            partition_penalty=partition_penalty,
+            teammate_radius=teammate_radius,
+            teammate_penalty=teammate_penalty,
+            progress_weight=progress_weight,
+            min_goal_distance=0.0,
+        )
+    if not candidate_pool:
         return None, None
 
-    for cells in frontier_components:
-        xsum = 0.0
-        ysum = 0.0
-        for gx, gy in cells:
-            xw, yw = grid_to_world_fn((gx, gy))
-            xsum += xw
-            ysum += yw
-        centroid = (xsum / len(cells), ysum / len(cells))
-        dist = math.hypot(centroid[0] - robot_xy[0], centroid[1] - robot_xy[1])
-        if dist < best_score:
-            best_score = dist
-            best = centroid
-            best_meta = {'cells': cells, 'fraction': 0.0, 'size': len(cells)}
-    return best, best_meta
+    candidate_pool.sort(key=lambda item: item[0])
+    limit = max(1, int(top_k_candidates))
+
+    best_goal = None
+    best_meta = None
+    best_score = float('inf')
+
+    for _, meta in candidate_pool[:limit]:
+        path = planner.astar(robot_xy, meta['xy'], known_grid, occupied_value)
+        if path is None:
+            continue
+        path_len = _path_length(path)
+        progress_cost = progress_weight * max(0.0, path_len - meta['euclid_dist'])
+        final_score = path_len + progress_cost - info_gain * meta['info_score'] - density_value_weight * meta.get('density_value', 0.0) + meta['teammate_cost'] + meta.get('centroid_cost', 0.0)
+        if used_fallback and not meta['in_partition']:
+            final_score += partition_penalty
+        if final_score < best_score:
+            best_score = final_score
+            best_goal = meta['xy']
+            best_meta = dict(meta)
+            best_meta['path_length'] = path_len
+            best_meta['progress_cost'] = progress_cost
+            best_meta['used_fallback'] = used_fallback and not meta['in_partition']
+
+    return best_goal, best_meta

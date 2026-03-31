@@ -1,16 +1,19 @@
+import json
 import os
 from datetime import datetime
+from pathlib import Path
 
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .config import COLOR_BOUNDARY, COLOR_OBSTACLE, OUTPUT_FOLDER_NAME, WORLD_HEIGHT_METERS, WORLD_WIDTH_METERS
-from .paths import output_dir
+from config import COLOR_BOUNDARY, COLOR_OBSTACLE, WORLD_HEIGHT_METERS, WORLD_WIDTH_METERS
 
 
-def make_output_dir():
-    return str(output_dir(OUTPUT_FOLDER_NAME))
+def ensure_directory(path):
+    out = Path(path)
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
 
 def grid_to_rgb(grid, free_value, occupied_value):
@@ -39,10 +42,10 @@ def draw_map_panel(ax, grid, drones, title, free_value, occupied_value, show_tra
         ax.plot([ex], [ey], marker='o', markersize=5.5, color=drone['color'], mec='black', mew=0.8)
 
 
-def save_trajectory_png(obstacles, drones, ts=None):
-    out_dir = make_output_dir()
+def save_trajectory_png(obstacles, drones, out_dir, ts=None):
+    out_dir = ensure_directory(out_dir)
     ts = ts or datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_path = os.path.join(out_dir, f'trajectories_{ts}.png')
+    out_path = out_dir / f'trajectories_{ts}.png'
 
     fig, ax = plt.subplots(figsize=(8.2, 7.8))
     ax.set_xlim(-0.4, WORLD_WIDTH_METERS + 0.4)
@@ -69,31 +72,40 @@ def save_trajectory_png(obstacles, drones, ts=None):
     fig.tight_layout(pad=0.8)
     fig.savefig(out_path, dpi=160, bbox_inches='tight')
     plt.close(fig)
-    return out_path
+    return str(out_path)
 
 
-def save_map_outputs(shared_known_grid, drones, free_value, occupied_value, ts=None):
-    out_dir = make_output_dir()
+def save_map_outputs(shared_known_grid, drones, free_value, occupied_value, out_dir, ts=None):
+    out_dir = ensure_directory(out_dir)
     ts = ts or datetime.now().strftime('%Y%m%d_%H%M%S')
-    shared_path = os.path.join(out_dir, f'shared_map_{ts}.png')
-    fig, ax = plt.subplots(figsize=(8.0, 7.4))
-    draw_map_panel(ax, shared_known_grid, drones, 'Shared observation map', free_value, occupied_value, show_trajectories=True)
-    fig.tight_layout(pad=0.8)
+    shared_path = out_dir / f'shared_map_{ts}.png'
+    panel_count = len(drones) + 1
+    ncols = 2 if panel_count > 1 else 1
+    nrows = int(np.ceil(panel_count / ncols))
+
+    fig = plt.figure(figsize=(6.8 * ncols, 6.0 * nrows))
+    axes = [fig.add_subplot(nrows, ncols, i + 1) for i in range(nrows * ncols)]
+    draw_map_panel(axes[0], shared_known_grid, drones, 'Shared observed map', free_value, occupied_value, show_trajectories=True)
+    fig.tight_layout(pad=0.9)
     fig.savefig(shared_path, dpi=170, bbox_inches='tight')
     plt.close(fig)
 
-    panel_count = len(drones) + 1
-    ncols = 2
-    nrows = int(np.ceil(panel_count / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(10.2, 4.6 * nrows))
-    axes = np.atleast_1d(axes).ravel()
-    draw_map_panel(axes[0], shared_known_grid, drones, 'Shared observation map', free_value, occupied_value, show_trajectories=True)
+    fig = plt.figure(figsize=(6.8 * ncols, 6.0 * nrows))
+    axes = [fig.add_subplot(nrows, ncols, i + 1) for i in range(nrows * ncols)]
+    draw_map_panel(axes[0], shared_known_grid, drones, 'Shared observed map', free_value, occupied_value, show_trajectories=True)
     for idx, drone in enumerate(drones, start=1):
-        draw_map_panel(axes[idx], drone['local_known_grid'], drones, f"{drone['name']} local map", free_value, occupied_value, show_trajectories=True)
+        draw_map_panel(axes[idx], drone['local_known_grid'], [drone], f"{drone['name']} local map", free_value, occupied_value, show_trajectories=True)
     for ax in axes[panel_count:]:
         ax.axis('off')
     fig.tight_layout(pad=0.9)
-    out_path = os.path.join(out_dir, f'observed_maps_{ts}.png')
+    out_path = out_dir / f'observed_maps_{ts}.png'
     fig.savefig(out_path, dpi=170, bbox_inches='tight')
     plt.close(fig)
-    return shared_path, out_path
+    return str(shared_path), str(out_path)
+
+
+def write_run_metadata(out_dir, metadata):
+    out_dir = ensure_directory(out_dir)
+    metadata_path = out_dir / 'run_metadata.json'
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    return str(metadata_path)
