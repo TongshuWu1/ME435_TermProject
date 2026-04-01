@@ -16,6 +16,7 @@ class SimulatorUI:
         self.sim = sim
         self.fig = None
         self.ax = None
+        self.status_ax = None
         self.status_text = None
         self.toggle_button = None
         self.reset_button = None
@@ -36,9 +37,19 @@ class SimulatorUI:
         self.partition_centroid_scatter = None
         self.density_image = None
 
+    def _make_panel(self, bounds, *, title=None, facecolor='#f5f5f5', title_fontsize=9):
+        ax = self.fig.add_axes(bounds)
+        ax.set_facecolor(facecolor)
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.0)
+            spine.set_edgecolor('#b8c0cc')
+        if title:
+            ax.set_title(title, fontsize=title_fontsize, pad=3)
+        return ax
+
     def build(self):
-        self.fig = plt.figure(figsize=(13.6, 8.9))
-        self.ax = self.fig.add_axes([0.05, 0.08, 0.64, 0.86])
+        self.fig = plt.figure(figsize=(14.8, 8.9))
+        self.ax = self.fig.add_axes([0.05, 0.08, 0.60, 0.86])
         self.ax.set_xlim(-0.35, WORLD_WIDTH_METERS + 0.35)
         self.ax.set_ylim(-0.35, WORLD_HEIGHT_METERS + 0.35)
         self.ax.set_aspect('equal')
@@ -75,62 +86,58 @@ class SimulatorUI:
             visible=self.sim.show_partition_overlay,
         )
 
-        self.status_text = self.fig.text(
-            0.76,
-            0.92,
+        self.status_ax = self._make_panel([0.68, 0.74, 0.28, 0.22], title='Run Status', facecolor='#fbfcfd')
+        self.status_ax.set_xticks([])
+        self.status_ax.set_yticks([])
+        self.status_ax.set_xlim(0.0, 1.0)
+        self.status_ax.set_ylim(0.0, 1.0)
+        self.status_text = self.status_ax.text(
+            0.03,
+            0.97,
             '',
-            fontsize=8.8,
+            transform=self.status_ax.transAxes,
+            fontsize=8.5,
             verticalalignment='top',
+            horizontalalignment='left',
             family='monospace',
+            clip_on=True,
         )
 
-        mission_ax = self.fig.add_axes([0.77, 0.80, 0.18, 0.09])
+        mission_ax = self._make_panel([0.68, 0.62, 0.135, 0.10], title='Mission Mode')
         self.mission_selector = RadioButtons(mission_ax, MISSION_MODE_LABELS, active=0 if self.sim.mission_mode == 'manual_click' else 1)
         self.mission_selector.on_clicked(self.sim.on_select_mission_mode)
-        mission_ax.set_title('Mission Mode', fontsize=9, pad=2)
-        mission_ax.set_facecolor('#f5f5f5')
 
-        auto_policy_ax = self.fig.add_axes([0.77, 0.68, 0.18, 0.09])
+        auto_policy_ax = self._make_panel([0.825, 0.62, 0.135, 0.10], title='Auto Policy')
         self.auto_policy_selector = RadioButtons(auto_policy_ax, AUTO_POLICY_LABELS, active=0 if getattr(self.sim, 'auto_policy', 'frontier') == 'frontier' else 1)
         self.auto_policy_selector.on_clicked(self.sim.on_select_auto_policy)
-        auto_policy_ax.set_title('Auto Policy', fontsize=9, pad=2)
-        auto_policy_ax.set_facecolor('#f5f5f5')
 
-        robot_ax = self.fig.add_axes([0.77, 0.54, 0.18, 0.12])
+        robot_ax = self._make_panel([0.68, 0.44, 0.135, 0.15], title='Robot')
         self.robot_selector = RadioButtons(robot_ax, DRONE_NAMES, active=0)
         self.robot_selector.on_clicked(self.sim.on_select_robot)
-        robot_ax.set_title('Robot', fontsize=9, pad=2)
-        robot_ax.set_facecolor('#f5f5f5')
 
-        mode_ax = self.fig.add_axes([0.77, 0.42, 0.18, 0.10])
+        mode_ax = self._make_panel([0.825, 0.44, 0.135, 0.15], title='Click Action')
         self.mode_selector = RadioButtons(mode_ax, EDIT_MODE_LABELS, active=0)
         self.mode_selector.on_clicked(self.sim.on_select_edit_mode)
-        mode_ax.set_title('Click Action', fontsize=9, pad=2)
-        mode_ax.set_facecolor('#f5f5f5')
 
-        toggle_ax = self.fig.add_axes([0.77, 0.35, 0.058, 0.052])
+        toggle_ax = self.fig.add_axes([0.68, 0.365, 0.085, 0.052])
         self.toggle_button = Button(toggle_ax, '')
         self.toggle_button.on_clicked(self.sim.toggle_auto_mode)
 
-        self.partition_button = Button(self.fig.add_axes([0.832, 0.35, 0.058, 0.052]), '')
-        self.density_button = Button(self.fig.add_axes([0.894, 0.35, 0.058, 0.052]), '')
+        self.partition_button = Button(self.fig.add_axes([0.777, 0.365, 0.085, 0.052]), '')
+        self.density_button = Button(self.fig.add_axes([0.875, 0.365, 0.085, 0.052]), '')
         self.partition_button.on_clicked(self.sim.toggle_partition_overlay)
         self.density_button.on_clicked(self.sim.toggle_density_overlay)
 
-        clear_ax = self.fig.add_axes([0.77, 0.28, 0.18, 0.052])
-        self.clear_button = Button(clear_ax, 'Clear Path/Goal')
+        clear_ax = self.fig.add_axes([0.68, 0.295, 0.28, 0.052])
+        self.clear_button = Button(clear_ax, 'Clear Path / Goal')
         self.clear_button.on_clicked(self.sim.clear_selected_path)
 
-        self.shared_map_ax = self.fig.add_axes([0.77, 0.12, 0.18, 0.13])
-        self.shared_map_ax.set_title('Shared Map', fontsize=9, pad=3)
+        self.shared_map_ax = self._make_panel([0.68, 0.10, 0.18, 0.17], title='Shared Map', facecolor='#fbfcfd')
         self.shared_map_ax.set_xlim(0.0, WORLD_WIDTH_METERS)
         self.shared_map_ax.set_ylim(0.0, WORLD_HEIGHT_METERS)
         self.shared_map_ax.set_aspect('equal')
         self.shared_map_ax.set_xticks([])
         self.shared_map_ax.set_yticks([])
-        for spine in self.shared_map_ax.spines.values():
-            spine.set_linewidth(1.2)
-            spine.set_edgecolor('#444444')
         cmap = ListedColormap(['#d9dde3', '#f8fbff', '#5b6470'])
         norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap.N)
         self.shared_map_image = self.shared_map_ax.imshow(
@@ -143,14 +150,14 @@ class SimulatorUI:
         )
         self.shared_robot_scatter = self.shared_map_ax.scatter([], [], s=28, c=[], edgecolors='black', linewidths=0.5)
 
-        seed_box_ax = self.fig.add_axes([0.77, 0.02, 0.11, 0.045])
+        seed_box_ax = self.fig.add_axes([0.88, 0.19, 0.08, 0.05])
         self.seed_box = TextBox(seed_box_ax, 'Seed ', initial=str(self.sim.current_seed))
 
-        apply_seed_ax = self.fig.add_axes([0.89, 0.02, 0.06, 0.045])
+        apply_seed_ax = self.fig.add_axes([0.88, 0.13, 0.08, 0.05])
         self.apply_seed_button = Button(apply_seed_ax, 'Apply')
         self.apply_seed_button.on_clicked(self.sim.apply_seed_from_box)
 
-        reset_ax = self.fig.add_axes([0.77, 0.07, 0.18, 0.045])
+        reset_ax = self.fig.add_axes([0.88, 0.07, 0.08, 0.05])
         self.reset_button = Button(reset_ax, 'Reset')
         self.reset_button.on_clicked(self.sim.reset_simulation)
 

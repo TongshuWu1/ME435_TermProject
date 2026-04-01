@@ -18,7 +18,11 @@ from config import (
     A_STAR_INFLATION_MARGIN,
     A_STAR_LOOKAHEAD_STEPS,
     A_STAR_REPLAN_SECONDS,
+    A_STAR_MIN_REPLAN_GAP_SECONDS,
     AUTO_EXPLORE_REPLAN_SECONDS,
+    AUTO_GOAL_MIN_HOLD_SECONDS,
+    AUTO_GOAL_STALE_SECONDS,
+    AUTO_GOAL_MIN_SWITCH_DISTANCE,
     AUTO_FRONTIER_INFO_GAIN,
     AUTO_FRONTIER_MIN_COMPONENT_CELLS,
     AUTO_FRONTIER_PARTITION_PENALTY,
@@ -43,6 +47,12 @@ from config import (
     AUTO_COVERAGE_DENSITY_GAIN,
     AUTO_COVERAGE_FALLBACK_GLOBAL,
     AUTO_COVERAGE_FRONTIER_BONUS,
+    AUTO_COVERAGE_FRONTIER_CLUSTER_GAIN,
+    AUTO_COVERAGE_FRONTIER_CONTACT_GAIN,
+    AUTO_COVERAGE_FRONTIER_PROXIMITY_GAIN,
+    AUTO_COVERAGE_GLOBAL_FALLBACK_PENALTY,
+    AUTO_COVERAGE_LOCAL_MASS_GAIN,
+    AUTO_COVERAGE_NONMAX_RADIUS_CELLS,
     AUTO_COVERAGE_PROGRESS_WEIGHT,
     AUTO_COVERAGE_ROBOT_DISTANCE_WEIGHT,
     AUTO_COVERAGE_TEAMMATE_PENALTY,
@@ -189,6 +199,12 @@ class Simulator:
             frontier_bonus=AUTO_COVERAGE_FRONTIER_BONUS,
             min_goal_distance=max(AUTO_FRONTIER_MIN_GOAL_DISTANCE, 1.05 * A_STAR_GOAL_TOLERANCE),
             free_density_baseline=AUTO_DENSITY_FREE_WEIGHT,
+            frontier_contact_gain=AUTO_COVERAGE_FRONTIER_CONTACT_GAIN,
+            frontier_cluster_gain=AUTO_COVERAGE_FRONTIER_CLUSTER_GAIN,
+            local_mass_gain=AUTO_COVERAGE_LOCAL_MASS_GAIN,
+            frontier_proximity_gain=AUTO_COVERAGE_FRONTIER_PROXIMITY_GAIN,
+            nonmax_radius_cells=AUTO_COVERAGE_NONMAX_RADIUS_CELLS,
+            global_fallback_penalty=AUTO_COVERAGE_GLOBAL_FALLBACK_PENALTY,
         )
 
         self.ui = SimulatorUI(self)
@@ -317,13 +333,15 @@ class Simulator:
         if not force and (self.time_elapsed - self._last_console_snapshot_time) < 2.0:
             return
         metrics = self._compute_live_metrics()
+        mission_name = 'auto explore' if self.mission_mode == 'auto_explore' else 'manual click'
+        policy_name = 'weighted coverage' if self.auto_policy == 'weighted_coverage' else 'frontier'
         print(
-            f"[{self.current_run_label or 'run'} t={self.time_elapsed:6.2f}s] "
-            f"known={100.0 * metrics['known_ratio']:5.1f}% "
-            f"free_covered={100.0 * metrics['free_coverage_ratio']:5.1f}% "
-            f"frontiers={metrics['frontier_count']:2d} "
-            f"active_goals={metrics['active_goals']:d} "
-            f"policy={self.auto_policy}"
+            f"[{self.current_run_label or 'run'} | t={self.time_elapsed:6.2f}s] "
+            f"mode={mission_name}, policy={policy_name}, "
+            f"map_known={100.0 * metrics['known_ratio']:5.1f}%, "
+            f"free_covered={100.0 * metrics['free_coverage_ratio']:5.1f}%, "
+            f"obstacles_found={100.0 * metrics['occupied_recall_ratio']:5.1f}%, "
+            f"frontier_groups={metrics['frontier_count']:d}, active_goals={metrics['active_goals']:d}"
         )
         self._last_console_snapshot_time = self.time_elapsed
 
@@ -332,9 +350,7 @@ class Simulator:
             return 'manual'
         meta = drone.get('auto_goal_meta') or {}
         if self.auto_policy == 'weighted_coverage':
-            if meta.get('frontier_gain', 0.0) > 0.0:
-                return 'coverage+frontier'
-            return 'coverage-centroid'
+            return str(meta.get('goal_flavor', 'coverage-fill'))
         if meta.get('used_fallback'):
             return 'frontier-fallback'
         return 'frontier'
@@ -348,16 +364,14 @@ class Simulator:
         mission_name = 'Auto Explore' if self.mission_mode == 'auto_explore' else 'Manual Click'
         policy_name = 'Weighted Coverage' if self.auto_policy == 'weighted_coverage' else 'Frontier'
         lines = [
-            f'State:   {sim_state}',
-            f'Mission: {mission_name}',
-            f'Policy:  {policy_name}',
-            f'Time:    {self.time_elapsed:5.1f} s',
-            f'Known:   {100.0 * metrics["known_ratio"]:5.1f} %',
-            f'Covered: {100.0 * metrics["free_coverage_ratio"]:5.1f} %',
-            f'Occ hit: {100.0 * metrics["occupied_recall_ratio"]:5.1f} %',
-            f'Frontier groups: {metrics["frontier_count"]}',
-            f'Active goals:    {metrics["active_goals"]}',
-            f'Seed:    {self.current_seed}',
+            f'State   : {sim_state}',
+            f'Mission : {mission_name}',
+            f'Policy  : {policy_name}',
+            f'Time    : {self.time_elapsed:5.1f} s    Seed: {self.current_seed}',
+            f'Map     : {100.0 * metrics["known_ratio"]:5.1f}% known',
+            f'Free    : {100.0 * metrics["free_coverage_ratio"]:5.1f}% covered',
+            f'Obs     : {100.0 * metrics["occupied_recall_ratio"]:5.1f}% found',
+            f'Frontier: {metrics["frontier_count"]} groups    Goals: {metrics["active_goals"]}',
         ]
         if drone is not None:
             est_x, est_y, _ = drone['odometry'].mu
@@ -368,16 +382,12 @@ class Simulator:
             last_landmark = '-' if drone.get('last_landmark_update_time') is None else f"{float(drone['last_landmark_update_time']):4.1f}s"
             lines.extend([
                 '',
-                f'Robot:   {drone["name"]}',
-                f'Phase:   {drone.get("auto_phase", "manual")}',
-                f'Goal:    {self._goal_type_for_drone(drone)}',
-                f'Goal xy: {goal_text}',
-                f'Est xy:  ({est_x:4.1f}, {est_y:4.1f})',
-                f'Path rem:{remaining_length:5.1f} m',
-                f'Replans: {drone.get("replan_count", 0)}',
-                f'Goals:   {drone.get("goal_assignment_count", 0)} set / {drone.get("goal_reached_count", 0)} reached',
-                f'Stuck:   {drone.get("stuck_events", 0)}',
-                f'Landmark:{drone.get("measurement_update_count", 0)} updates @ {last_landmark}',
+                f'Robot   : {drone["name"]}    Phase: {drone.get("auto_phase", "manual")}',
+                f'Goal    : {self._goal_type_for_drone(drone)} -> {goal_text}',
+                f'Est xy  : ({est_x:4.1f}, {est_y:4.1f})    Path: {remaining_length:4.1f} m',
+                f'Goals   : {drone.get("goal_reached_count", 0)} reached / {drone.get("goal_assignment_count", 0)} assigned',
+                f'Replans : {drone.get("replan_count", 0)}    Stuck: {drone.get("stuck_events", 0)}',
+                f'Landmark: {drone.get("measurement_update_count", 0)} updates    Last: {last_landmark}',
             ])
         return '\n'.join(lines)
 
@@ -863,7 +873,7 @@ class Simulator:
         meta_dict = {} if meta is None else dict(meta)
         if goal_xy is not None:
             meta_dict['policy'] = self.auto_policy
-            meta_dict['goal_type'] = self._goal_type_for_drone({'auto_goal_meta': meta_dict}) if meta_dict else ('coverage-centroid' if self.auto_policy == 'weighted_coverage' else 'frontier')
+            meta_dict['goal_type'] = self._goal_type_for_drone({'auto_goal_meta': meta_dict}) if meta_dict else ('coverage-fill' if self.auto_policy == 'weighted_coverage' else 'frontier')
         drone['auto_goal_meta'] = meta_dict or None
         if goal_xy is not None:
             drone['last_goal_type'] = self._goal_type_for_drone(drone)
@@ -908,6 +918,37 @@ class Simulator:
                 return centroid
         return None
 
+    def _current_goal_valid(self, drone):
+        goal_xy = drone.get('auto_goal_xy')
+        if goal_xy is None:
+            return False
+        x_est, y_est, _ = drone['odometry'].mu
+        goal_tol = AUTO_LAUNCH_DISPERSAL_GOAL_TOLERANCE if (self.mission_mode == 'auto_explore' and drone.get('auto_phase', 'explore') == 'launch') else A_STAR_GOAL_TOLERANCE
+        return math.hypot(float(goal_xy[0]) - x_est, float(goal_xy[1]) - y_est) > 1.05 * goal_tol
+
+    def _should_keep_current_auto_goal(self, drone, candidate_goal_xy, candidate_meta):
+        current_goal = drone.get('auto_goal_xy')
+        if current_goal is None:
+            return False
+        goal_age = float(self.time_elapsed - drone.get('auto_goal_last_set_time', -1e9))
+        current_valid = self._current_goal_valid(drone)
+        if not current_valid:
+            return False
+        if not drone.get('path'):
+            return False
+        if goal_age < float(AUTO_GOAL_MIN_HOLD_SECONDS):
+            return True
+        if candidate_goal_xy is None:
+            return goal_age < float(AUTO_GOAL_STALE_SECONDS)
+        goal_sep = math.hypot(float(candidate_goal_xy[0]) - float(current_goal[0]), float(candidate_goal_xy[1]) - float(current_goal[1]))
+        if goal_sep < float(AUTO_GOAL_MIN_SWITCH_DISTANCE):
+            return True
+        current_type = str(drone.get('last_goal_type', ''))
+        candidate_type = '' if not candidate_meta else str(candidate_meta.get('goal_flavor') or candidate_meta.get('goal_type') or '')
+        if goal_age < float(AUTO_GOAL_STALE_SECONDS) and candidate_type == current_type:
+            return True
+        return False
+
     def _choose_auto_goal(self, drone):
         x_est, y_est, _ = drone['odometry'].mu
         teammate_positions, teammate_goal_positions = self._teammate_context(drone)
@@ -926,10 +967,12 @@ class Simulator:
                 known_grid=self.shared_known_grid,
                 free_value=FREE,
                 occupied_value=OCCUPIED,
+                unknown_value=UNKNOWN,
                 planner=self.planner,
                 grid_to_world_fn=self._grid_to_world,
                 world_to_grid_fn=self._world_to_grid,
                 frontier_components=self.frontier_components,
+                visited_cells=drone.get('visited_cells', set()),
                 **common,
             )
         return self.frontier_controller.choose_goal(
@@ -1055,33 +1098,35 @@ class Simulator:
     def _ensure_auto_goal(self, drone):
         if self.mission_mode != 'auto_explore':
             return
-        x_est, y_est, _ = drone['odometry'].mu
 
         if drone.get('auto_phase', 'launch') == 'launch' and self._launch_phase_expired(drone):
             drone['auto_phase'] = 'explore'
             drone['auto_goal_xy'] = None
             drone['path'] = []
 
-        need_goal = False
-        if drone.get('auto_goal_xy') is None:
-            need_goal = True
-        elif (self.time_elapsed - drone.get('auto_goal_last_set_time', -1e9)) >= AUTO_EXPLORE_REPLAN_SECONDS:
-            need_goal = True
-        elif drone.get('just_discovered_obstacle', False):
-            need_goal = True
-        elif not drone.get('path'):
-            need_goal = True
-        if not need_goal:
+        current_goal = drone.get('auto_goal_xy')
+        goal_age = float(self.time_elapsed - drone.get('auto_goal_last_set_time', -1e9))
+        immediate_reassign = (
+            current_goal is None
+            or not drone.get('path')
+            or not self._current_goal_valid(drone)
+        )
+        periodic_review = (not immediate_reassign) and (goal_age >= float(AUTO_EXPLORE_REPLAN_SECONDS))
+        if not immediate_reassign and not periodic_review:
             return
 
         if drone.get('auto_phase', 'launch') == 'launch':
             stage_goal = self._choose_launch_staging_goal(drone)
             if stage_goal is not None:
+                if self._should_keep_current_auto_goal(drone, stage_goal, None):
+                    return
                 self._assign_auto_goal(drone, stage_goal)
                 return
             drone['auto_phase'] = 'explore'
 
         goal_xy, meta = self._choose_auto_goal(drone)
+        if self._should_keep_current_auto_goal(drone, goal_xy, meta):
+            return
         self._assign_auto_goal(drone, goal_xy, meta=meta)
 
     def _astar(self, start_xy, goal_xy, known_grid):
@@ -1380,19 +1425,15 @@ class Simulator:
         x_est, y_est, _ = drone['odometry'].mu
         goal = path[target_idx]
         planning_occ = self._planning_occupancy(self.shared_known_grid)
-        need_replan = False
-        if drone['plan_goal_index'] != target_idx:
-            need_replan = True
-        elif (self.time_elapsed - drone['last_plan_time']) >= A_STAR_REPLAN_SECONDS:
-            need_replan = True
-        elif not drone['planned_path']:
-            need_replan = True
-        elif KNOWN_MAP_REPLAN_ON_NEW_OBS and drone['just_discovered_obstacle']:
-            need_replan = True
-        elif drone['path_progress_index'] < len(drone['planned_path']):
-            next_pt = drone['planned_path'][drone['path_progress_index']]
-            if self._line_crosses_blocked((x_est, y_est), next_pt, planning_occ):
-                need_replan = True
+        plan_age = float(self.time_elapsed - drone['last_plan_time'])
+        goal_changed = drone['plan_goal_index'] != target_idx
+        missing_path = not drone['planned_path']
+
+        goal_gx, goal_gy = self._world_to_grid(*goal)
+        goal_blocked = bool(planning_occ[goal_gy, goal_gx])
+        allow_blocked_refresh = goal_blocked and plan_age >= max(A_STAR_MIN_REPLAN_GAP_SECONDS, 1.5)
+
+        need_replan = goal_changed or missing_path or allow_blocked_refresh
 
         if need_replan:
             old_path = list(drone['planned_path'])
@@ -1406,8 +1447,14 @@ class Simulator:
                 drone['path_progress_index'] = 1 if len(new_path) > 1 else 0
                 old_len = polyline_length(old_path)
                 new_len = polyline_length(new_path)
+                if goal_changed:
+                    reason = 'goal update'
+                elif goal_blocked:
+                    reason = 'goal blocked'
+                else:
+                    reason = 'path refresh'
                 if (not old_path) or abs(new_len - old_len) > 0.75 or drone['replan_count'] in (1, 5, 10):
-                    self._log_event('replan', f"Replanned path with {len(new_path)} points", drone=drone, path_length=round(new_len, 3))
+                    self._log_event('replan', f"Replanned path with {len(new_path)} points ({reason})", drone=drone, path_length=round(new_len, 3))
             elif old_path:
                 drone['planned_path'] = old_path
                 drone['path_progress_index'] = min(drone['path_progress_index'], max(0, len(old_path) - 1))
