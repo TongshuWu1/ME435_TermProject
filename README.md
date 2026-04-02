@@ -14,7 +14,7 @@ Top-level modules:
 - `src/mapping_utils.py` — map update helpers
 - `src/environment.py` — obstacle and landmark generation
 - `src/output_utils.py` — saved trajectory and map figures
-- `src/reporting.py` — run summaries, event logs, coverage-history CSVs, and coverage progress plots
+- `src/reporting.py` — human-readable run summaries, CSV reports, and coverage progress plots
 - `src/paths.py` — project-root and output-folder helpers
 - `src/robot.py` — robot motion, collision checks, landmark detection, and obstacle scans
 - `src/localization.py` — EKF state estimator
@@ -41,7 +41,7 @@ Compatibility shim:
    - frontiers are detected from the shared known map
    - a Voronoi-style partition is computed from the robots' estimated positions
    - you can switch between **Frontier** and **Weighted Coverage** auto policies
-   - the weighted-coverage policy drives each robot toward a reachable, high-density point near its weighted partition centroid
+   - the weighted-coverage policy now favors reachable, high-information pockets in each robot's region, penalizes revisiting already-worked cells, and uses the partition centroid only as a soft fallback
    - A* is still used to route to that goal
 
 ## UI notes
@@ -50,9 +50,10 @@ Compatibility shim:
 - `Start / Pause` controls the simulation.
 - `Show / Hide Region` toggles the partition overlay.
 - `Show / Hide Density` toggles the density overlay.
+- The top-right status block is now clipped inside its own panel so it no longer covers the main canvas.
 - The small map on the right is the shared explored map.
 
 ## Notes
 - The simulator starts paused.
-- Each run saves a folder under `outputs/` containing trajectory/map PNGs plus `run_summary.json`, `robot_stats.csv`, `coverage_history.csv`, and `event_log.csv`.
+- Each run saves a folder under `outputs/` containing trajectory/map PNGs plus `run_summary.txt`, `run_summary.json`, `robot_summary.csv`, `coverage_timeline.csv`, and `event_timeline.csv`.
 - Robot count is determined by `DRONE_NAMES` in `config.py`.

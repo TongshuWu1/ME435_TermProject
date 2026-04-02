@@ -1,5 +1,5 @@
 {
-  "run_label": "run_001_seed_124_20260331_135521",
+  "run_label": "run_001_seed_124_20260401_030110",
   "seed": 124,
   "mission_mode": "auto_explore",
   "auto_policy": "weighted_coverage",
@@ -10,7 +10,7 @@
     "Drone 3",
     "Drone 4"
   ],
-  "sim_time_seconds": 28.850000000000275,
+  "sim_time_seconds": 63.14999999999855,
   "auto_mode_enabled_at_save": true,
-  "saved_at": "2026-03-31T13:56:25"
+  "saved_at": "2026-04-01T03:03:43"
 }
