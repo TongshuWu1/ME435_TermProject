@@ -1,0 +1,5 @@
+name,phase,goal_type,goal_assignments,goals_reached,replans,replans_blocked,stuck_events,measurement_updates,last_landmark_update_time,distance_travelled_m,idle_time_s,visited_cell_count,path_waypoint_count,remaining_path_points,remaining_path_length_m,final_true_x,final_true_y,final_est_x,final_est_y
+Drone 1,explore,none,50,1,102,0,2,117,10.0,65.514,1.15,66,0,0,0.0,38.834,11.471,36.387,10.968
+Drone 2,explore,none,53,1,89,0,0,1100,70.05,69.393,1.15,82,0,0,0.0,32.897,6.685,32.878,6.706
+Drone 3,explore,none,53,1,92,0,0,863,68.6,69.221,1.4,64,0,0,0.0,17.6,12.908,17.524,12.793
+Drone 4,explore,none,35,1,101,0,0,862,61.1,67.582,1.4,84,0,0,0.0,22.947,7.907,22.674,7.732
