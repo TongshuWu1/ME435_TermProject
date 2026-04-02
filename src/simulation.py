@@ -131,6 +131,7 @@ class Simulator:
         self.landmark_patches = []
         self.obstacle_patches = []
         self.landmarks = []
+        self.shared_known_landmarks = {}
         self.obstacles = []
         self.fov_angle = FOV_ANGLE
         self.view_distance = VIEW_DISTANCE
@@ -301,6 +302,9 @@ class Simulator:
         metrics['selected_robot'] = self.drones[self.selected_drone_index]['name'] if getattr(self, 'drones', None) else ''
         metrics['mission_mode'] = self.mission_mode
         metrics['auto_policy'] = self.auto_policy
+        metrics['landmarks_total'] = int(len(getattr(self, 'landmarks', [])))
+        metrics['landmarks_discovered'] = int(len(getattr(self, 'shared_known_landmarks', {})))
+        metrics['landmark_recall_ratio'] = (metrics['landmarks_discovered'] / metrics['landmarks_total']) if metrics['landmarks_total'] else 0.0
         self._live_metrics = metrics
         return metrics
 
@@ -323,6 +327,9 @@ class Simulator:
             'selected_robot': metrics['selected_robot'],
             'auto_policy': metrics['auto_policy'],
             'mission_mode': metrics['mission_mode'],
+            'landmarks_total': int(metrics.get('landmarks_total', 0)),
+            'landmarks_discovered': int(metrics.get('landmarks_discovered', 0)),
+            'landmark_recall_ratio': round(float(metrics.get('landmark_recall_ratio', 0.0)), 6),
         }
         if self.coverage_history and self.coverage_history[-1] == row:
             return
@@ -341,6 +348,7 @@ class Simulator:
             f"map_known={100.0 * metrics['known_ratio']:5.1f}%, "
             f"free_covered={100.0 * metrics['free_coverage_ratio']:5.1f}%, "
             f"obstacles_found={100.0 * metrics['occupied_recall_ratio']:5.1f}%, "
+            f"landmarks={metrics.get('landmarks_discovered', 0):d}/{metrics.get('landmarks_total', 0):d}, "
             f"frontier_groups={metrics['frontier_count']:d}, active_goals={metrics['active_goals']:d}"
         )
         self._last_console_snapshot_time = self.time_elapsed
@@ -354,6 +362,92 @@ class Simulator:
         if meta.get('used_fallback'):
             return 'frontier-fallback'
         return 'frontier'
+
+
+    @staticmethod
+    def _landmark_key(landmark):
+        return f"{str(landmark.shape)}|{str(landmark.color_name)}|{float(landmark.x):.3f}|{float(landmark.y):.3f}"
+
+    @staticmethod
+    def _serialize_landmark(landmark, *, seen_time=0.0, robot_name=''):
+        return {
+            'shape': str(landmark.shape),
+            'color_name': str(landmark.color_name),
+            'x': round(float(landmark.x), 3),
+            'y': round(float(landmark.y), 3),
+            'size': round(float(getattr(landmark, 'size', 0.8)), 3),
+            'seen_count': 1,
+            'first_seen_time': round(float(seen_time), 3),
+            'last_seen_time': round(float(seen_time), 3),
+            'first_seen_by': str(robot_name),
+            'last_seen_by': str(robot_name),
+            'seen_by': {str(robot_name)} if robot_name else set(),
+        }
+
+    def _remember_landmarks(self, drone, detected):
+        robot_name = str(drone.get('name', ''))
+        seen_time = float(self.time_elapsed)
+        new_shared = []
+        visible_keys = []
+        local_memory = drone.setdefault('known_landmarks', {})
+        for landmark in detected:
+            key = self._landmark_key(landmark)
+            visible_keys.append(key)
+            if key not in local_memory:
+                local_memory[key] = self._serialize_landmark(landmark, seen_time=seen_time, robot_name=robot_name)
+            else:
+                entry = local_memory[key]
+                entry['seen_count'] = int(entry.get('seen_count', 0)) + 1
+                entry['last_seen_time'] = round(seen_time, 3)
+                entry['last_seen_by'] = robot_name
+                entry.setdefault('seen_by', set()).add(robot_name)
+            if key not in self.shared_known_landmarks:
+                self.shared_known_landmarks[key] = self._serialize_landmark(landmark, seen_time=seen_time, robot_name=robot_name)
+                new_shared.append(key)
+            else:
+                entry = self.shared_known_landmarks[key]
+                entry['seen_count'] = int(entry.get('seen_count', 0)) + 1
+                entry['last_seen_time'] = round(seen_time, 3)
+                entry['last_seen_by'] = robot_name
+                entry.setdefault('seen_by', set()).add(robot_name)
+        drone['last_detected_landmarks'] = visible_keys
+        return new_shared
+
+    def _landmark_rows(self):
+        rows = []
+        for idx, (key, row) in enumerate(sorted(self.shared_known_landmarks.items(), key=lambda kv: (float(kv[1].get('first_seen_time', 0.0)), kv[0])), start=1):
+            seen_by = sorted(str(x) for x in row.get('seen_by', set()) if str(x))
+            rows.append({
+                'landmark_id': idx,
+                'landmark_key': key,
+                'shape': row.get('shape', ''),
+                'color_name': row.get('color_name', row.get('color', '')),
+                'x_m': row.get('x', ''),
+                'y_m': row.get('y', ''),
+                'size_m': row.get('size', ''),
+                'seen_count': row.get('seen_count', 0),
+                'first_seen_time_s': row.get('first_seen_time', 0.0),
+                'last_seen_time_s': row.get('last_seen_time', 0.0),
+                'first_seen_by': row.get('first_seen_by', ''),
+                'last_seen_by': row.get('last_seen_by', ''),
+                'seen_by_count': len(seen_by),
+                'seen_by_robots': ', '.join(seen_by),
+            })
+        return rows
+
+    def _remaining_path_length(self, drone):
+        path = list(drone.get('planned_path', []))
+        if not path:
+            return 0.0
+        progress_index = max(0, int(drone.get('path_progress_index', 0)))
+        if progress_index >= len(path):
+            return 0.0
+        remaining = path[progress_index:]
+        est_x, est_y, _ = drone['odometry'].mu
+        total = polyline_length(remaining)
+        first_x, first_y = remaining[0]
+        total += math.hypot(float(first_x) - float(est_x), float(first_y) - float(est_y))
+        return total
 
     def build_status_text(self):
         metrics = self._live_metrics if self._live_metrics is not None else self._compute_live_metrics()
@@ -371,13 +465,13 @@ class Simulator:
             f'Map     : {100.0 * metrics["known_ratio"]:5.1f}% known',
             f'Free    : {100.0 * metrics["free_coverage_ratio"]:5.1f}% covered',
             f'Obs     : {100.0 * metrics["occupied_recall_ratio"]:5.1f}% found',
+            f'Landmk  : {int(metrics.get("landmarks_discovered", 0))}/{int(metrics.get("landmarks_total", 0))} discovered',
             f'Frontier: {metrics["frontier_count"]} groups    Goals: {metrics["active_goals"]}',
         ]
         if drone is not None:
             est_x, est_y, _ = drone['odometry'].mu
             goal_xy = drone.get('auto_goal_xy')
-            remaining_path = drone.get('planned_path', [])
-            remaining_length = polyline_length(remaining_path[max(0, int(drone.get('path_progress_index', 0))):])
+            remaining_length = self._remaining_path_length(drone)
             goal_text = 'none' if goal_xy is None else f'({goal_xy[0]:4.1f}, {goal_xy[1]:4.1f})'
             last_landmark = '-' if drone.get('last_landmark_update_time') is None else f"{float(drone['last_landmark_update_time']):4.1f}s"
             lines.extend([
@@ -386,8 +480,9 @@ class Simulator:
                 f'Goal    : {self._goal_type_for_drone(drone)} -> {goal_text}',
                 f'Est xy  : ({est_x:4.1f}, {est_y:4.1f})    Path: {remaining_length:4.1f} m',
                 f'Goals   : {drone.get("goal_reached_count", 0)} reached / {drone.get("goal_assignment_count", 0)} assigned',
-                f'Replans : {drone.get("replan_count", 0)}    Stuck: {drone.get("stuck_events", 0)}',
-                f'Landmark: {drone.get("measurement_update_count", 0)} updates    Last: {last_landmark}',
+                f'Replan attempts: {drone.get("replan_count", 0)}    Stuck: {drone.get("stuck_events", 0)}',
+                f'Landmk  : {len(drone.get("known_landmarks", {}))} local, {len(drone.get("last_detected_landmarks", []))} vis',
+                f'Updates : {drone.get("measurement_update_count", 0)} corr    Last: {last_landmark}',
             ])
         return '\n'.join(lines)
 
@@ -590,11 +685,11 @@ class Simulator:
         drone['auto_phase'] = 'launch'
         drone['path'] = []
         drone['current_target_index'] = 0
-        drone['planned_path'] = [(x_est, y_est)]
+        drone['planned_path'] = []
         drone['path_progress_index'] = 0
         drone['plan_goal_index'] = -1
         drone['last_plan_time'] = -1e9
-        drone['plan_line'].set_data([x_est], [y_est])
+        drone['plan_line'].set_data([], [])
         drone['subgoal_marker'].set_data([], [])
         drone['last_goal_type'] = 'none'
         self._update_mission_artist(drone)
@@ -646,41 +741,143 @@ class Simulator:
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         self._record_coverage_snapshot(force=True)
         self.last_saved_plot_path = save_trajectory_png(self.obstacles, self.drones, self.current_run_dir, ts=ts)
-        _, self.last_saved_map_path = save_map_outputs(self.shared_known_grid, self.drones, FREE, OCCUPIED, self.current_run_dir, ts=ts)
+        _, self.last_saved_map_path = save_map_outputs(
+            self.shared_known_grid,
+            self.drones,
+            FREE,
+            OCCUPIED,
+            self.current_run_dir,
+            ts=ts,
+            shared_landmarks=list(self.shared_known_landmarks.values()),
+        )
         metadata = self._run_metadata()
         write_run_metadata(self.current_run_dir, metadata)
         metrics = self._compute_live_metrics()
         robot_rows = []
+        all_position_errors = []
+        final_position_errors = []
+        total_distance = 0.0
+        total_idle_time = 0.0
+        total_goal_assignments = 0
+        total_goals_reached = 0
+        total_replan_attempts = 0
+        total_replan_failures = 0
+        total_stuck_events = 0
+        total_landmark_updates = 0
+        pending_manual_goals = 0
         for drone in self.drones:
+            robot = drone['robot']
             est_x, est_y, _ = drone['odometry'].mu
+            trace_x = list(drone.get('trace_x', []))
+            trace_y = list(drone.get('trace_y', []))
+            est_trace_x = list(drone.get('est_trace_x', []))
+            est_trace_y = list(drone.get('est_trace_y', []))
+            error_count = min(len(trace_x), len(trace_y), len(est_trace_x), len(est_trace_y))
+            position_errors = [
+                math.hypot(float(trace_x[i]) - float(est_trace_x[i]), float(trace_y[i]) - float(est_trace_y[i]))
+                for i in range(error_count)
+            ]
+            if not position_errors:
+                position_errors = [math.hypot(float(robot.x) - float(est_x), float(robot.y) - float(est_y))]
+            final_position_error = float(position_errors[-1])
+            mean_position_error = float(sum(position_errors) / len(position_errors))
+            rms_position_error = float(math.sqrt(sum(err * err for err in position_errors) / len(position_errors)))
+            max_position_error = float(max(position_errors))
+
+            replan_attempts = int(drone.get('replan_count', 0))
+            replan_failures = int(drone.get('blocked_replan_count', 0))
+            replan_successes = max(0, replan_attempts - replan_failures)
+            goal_assignments = int(drone.get('goal_assignment_count', 0))
+            goals_reached = int(drone.get('goal_reached_count', 0))
+            distance_travelled = float(drone.get('distance_travelled', 0.0))
+            idle_time = float(drone.get('idle_time', 0.0))
+            remaining_points = max(0, len(drone.get('planned_path', [])) - max(0, int(drone.get('path_progress_index', 0))))
+            manual_remaining = max(0, len(drone.get('path', [])) - int(drone.get('current_target_index', 0))) if self.mission_mode == 'manual_click' else 0
+
+            all_position_errors.extend(position_errors)
+            final_position_errors.append(final_position_error)
+            total_distance += distance_travelled
+            total_idle_time += idle_time
+            total_goal_assignments += goal_assignments
+            total_goals_reached += goals_reached
+            total_replan_attempts += replan_attempts
+            total_replan_failures += replan_failures
+            total_stuck_events += int(drone.get('stuck_events', 0))
+            total_landmark_updates += int(drone.get('measurement_update_count', 0))
+            pending_manual_goals += manual_remaining
+
             robot_rows.append({
                 'name': drone['name'],
                 'phase': drone.get('auto_phase', 'manual'),
                 'goal_type': drone.get('last_goal_type', 'none'),
-                'goal_assignments': int(drone.get('goal_assignment_count', 0)),
-                'goals_reached': int(drone.get('goal_reached_count', 0)),
-                'replans': int(drone.get('replan_count', 0)),
-                'replans_blocked': int(drone.get('blocked_replan_count', 0)),
+                'goal_assignments': goal_assignments,
+                'goals_reached': goals_reached,
+                'replan_attempts': replan_attempts,
+                'replan_failures': replan_failures,
+                'replan_successes': replan_successes,
+                'replan_failure_rate': round(replan_failures / replan_attempts, 6) if replan_attempts else 0.0,
                 'stuck_events': int(drone.get('stuck_events', 0)),
                 'measurement_updates': int(drone.get('measurement_update_count', 0)),
+                'landmarks_discovered': int(len(drone.get('known_landmarks', {}))),
+                'currently_visible_landmarks': int(len(drone.get('last_detected_landmarks', []))),
                 'last_landmark_update_time': '' if drone.get('last_landmark_update_time') is None else round(float(drone.get('last_landmark_update_time')), 3),
-                'distance_travelled_m': round(float(drone.get('distance_travelled', 0.0)), 3),
-                'idle_time_s': round(float(drone.get('idle_time', 0.0)), 3),
+                'distance_travelled_m': round(distance_travelled, 3),
+                'idle_time_s': round(idle_time, 3),
+                'idle_fraction': round(idle_time / float(self.time_elapsed), 6) if self.time_elapsed > 1e-9 else 0.0,
                 'visited_cell_count': int(len(drone.get('visited_cells', []))),
                 'path_waypoint_count': int(len(drone.get('manual_path', []))),
-                'remaining_path_points': int(len(drone.get('planned_path', []))),
-                'remaining_path_length_m': round(polyline_length(drone.get('planned_path', [])[max(0, int(drone.get('path_progress_index', 0))):]), 3),
-                'final_true_x': round(float(drone['robot'].x), 3),
-                'final_true_y': round(float(drone['robot'].y), 3),
+                'remaining_path_points': remaining_points,
+                'remaining_path_length_m': round(self._remaining_path_length(drone), 3),
+                'mean_position_error_m': round(mean_position_error, 3),
+                'rms_position_error_m': round(rms_position_error, 3),
+                'max_position_error_m': round(max_position_error, 3),
+                'final_position_error_m': round(final_position_error, 3),
+                'final_true_x': round(float(robot.x), 3),
+                'final_true_y': round(float(robot.y), 3),
                 'final_est_x': round(float(est_x), 3),
                 'final_est_y': round(float(est_y), 3),
             })
+
+        mean_position_error = float(sum(all_position_errors) / len(all_position_errors)) if all_position_errors else 0.0
+        rms_position_error = float(math.sqrt(sum(err * err for err in all_position_errors) / len(all_position_errors))) if all_position_errors else 0.0
+        max_position_error = float(max(all_position_errors)) if all_position_errors else 0.0
+        mean_final_position_error = float(sum(final_position_errors) / len(final_position_errors)) if final_position_errors else 0.0
+        max_final_position_error = float(max(final_position_errors)) if final_position_errors else 0.0
+        team_idle_fraction = (total_idle_time / (float(self.time_elapsed) * max(1, len(self.drones)))) if self.time_elapsed > 1e-9 else 0.0
+        goal_reassignments = max(0, total_goal_assignments - total_goals_reached)
+        total_landmarks = int(len(self.landmarks))
+        shared_landmarks_discovered = int(len(self.shared_known_landmarks))
+        landmark_rows = self._landmark_rows()
         summary = {
             'known_ratio': round(float(metrics['known_ratio']), 6),
             'free_coverage_ratio': round(float(metrics['free_coverage_ratio']), 6),
             'occupied_recall_ratio': round(float(metrics['occupied_recall_ratio']), 6),
             'frontier_count': int(metrics['frontier_count']),
             'active_goals': int(metrics['active_goals']),
+            'pending_manual_goals': int(pending_manual_goals),
+            'total_distance_m': round(total_distance, 3),
+            'total_idle_time_s': round(total_idle_time, 3),
+            'team_idle_fraction': round(team_idle_fraction, 6),
+            'coverage_rate_pct_per_s': round((100.0 * float(metrics['free_coverage_ratio']) / float(self.time_elapsed)) if self.time_elapsed > 1e-9 else 0.0, 6),
+            'coverage_per_meter_pct_per_m': round((100.0 * float(metrics['free_coverage_ratio']) / total_distance) if total_distance > 1e-9 else 0.0, 6),
+            'obstacle_recall_rate_pct_per_s': round((100.0 * float(metrics['occupied_recall_ratio']) / float(self.time_elapsed)) if self.time_elapsed > 1e-9 else 0.0, 6),
+            'total_goal_assignments': int(total_goal_assignments),
+            'total_goals_reached': int(total_goals_reached),
+            'goal_reassignments': int(goal_reassignments),
+            'goal_completion_rate': round((total_goals_reached / total_goal_assignments) if total_goal_assignments else 0.0, 6),
+            'total_replan_attempts': int(total_replan_attempts),
+            'total_replan_failures': int(total_replan_failures),
+            'replan_failure_rate': round((total_replan_failures / total_replan_attempts) if total_replan_attempts else 0.0, 6),
+            'total_stuck_events': int(total_stuck_events),
+            'total_landmark_updates': int(total_landmark_updates),
+            'total_landmarks': int(total_landmarks),
+            'shared_landmarks_discovered': int(shared_landmarks_discovered),
+            'landmark_discovery_ratio': round((shared_landmarks_discovered / total_landmarks) if total_landmarks else 0.0, 6),
+            'mean_position_error_m': round(mean_position_error, 6),
+            'rms_position_error_m': round(rms_position_error, 6),
+            'max_position_error_m': round(max_position_error, 6),
+            'mean_final_position_error_m': round(mean_final_position_error, 6),
+            'max_final_position_error_m': round(max_final_position_error, 6),
             'event_count': int(len(self.event_log)),
             'coverage_samples': int(len(self.coverage_history)),
             'auto_finished': bool(self.auto_finished),
@@ -694,6 +891,7 @@ class Simulator:
             coverage_history=self.coverage_history,
             event_log=self.event_log,
             robot_rows=robot_rows,
+            landmark_rows=landmark_rows,
             summary=summary,
             ts=ts,
         )
@@ -718,6 +916,7 @@ class Simulator:
             OCCUPIED,
             out_dir,
             ts=ts,
+            shared_landmarks=list(self.shared_known_landmarks.values()),
         )
         self.last_saved_map_path = maps_path
         return maps_path
@@ -748,6 +947,7 @@ class Simulator:
         obstacles, landmark_dicts = generate_environment(self.current_seed)
         self.obstacles = list(obstacles)
         self.landmarks = [Landmark(**lm) for lm in landmark_dicts]
+        self.shared_known_landmarks = {}
         self.generated_target_sequences = empty_target_sequences()
         self.truth_occupancy = self._build_truth_occupancy_grid()
         self._mark_partition_dirty()
@@ -1318,6 +1518,7 @@ class Simulator:
         self.time_elapsed = 0.0
         self.ui.seed_box.set_val(str(self.current_seed))
         self.shared_known_grid = self._init_known_grid()
+        self.shared_known_landmarks = {}
 
         for idx, drone in enumerate(self.drones):
             start_x, start_y, start_angle = self._start_pose_for_index(idx, len(self.drones))
@@ -1368,6 +1569,8 @@ class Simulator:
             drone['goal_reached_count'] = 0
             drone['measurement_update_count'] = 0
             drone['last_landmark_update_time'] = None
+            drone['known_landmarks'] = {}
+            drone['last_detected_landmarks'] = []
             drone['distance_travelled'] = 0.0
             drone['idle_time'] = 0.0
             drone['last_goal_type'] = 'none'
@@ -1664,6 +1867,19 @@ class Simulator:
             )
 
         detected = robot.detect_landmarks(self.landmarks, self.fov_angle, self.view_distance, obstacles=self.obstacles)
+        new_shared_landmarks = self._remember_landmarks(drone, detected)
+        for key in new_shared_landmarks:
+            row = self.shared_known_landmarks.get(key, {})
+            self._log_event(
+                'landmark_discovered',
+                f"Discovered {row.get('color_name', '')} {row.get('shape', '')} landmark at ({float(row.get('x', 0.0)):.1f}, {float(row.get('y', 0.0)):.1f})",
+                drone=drone,
+                landmark_shape=row.get('shape', ''),
+                landmark_color=row.get('color_name', ''),
+                landmark_x=row.get('x', 0.0),
+                landmark_y=row.get('y', 0.0),
+                landmark_total=len(self.shared_known_landmarks),
+            )
         measurements = []
         for lm in detected:
             dx = lm.x - robot.x

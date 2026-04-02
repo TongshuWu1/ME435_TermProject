@@ -1,5 +1,0 @@
-robot,phase,last_goal_type,goal_assignments,goals_reached,replans,blocked_replans,stuck_events,landmark_updates,last_landmark_update_time_s,distance_travelled_m,idle_time_s,visited_cell_count,manual_waypoint_count,remaining_path_points,remaining_path_length_m,final_true_x,final_true_y,final_est_x,final_est_y
-Drone 1,explore,none,10,1,26,0,0,391,34.25,59.81,0.9,69,0,0,0.0,36.611,31.094,36.452,30.216
-Drone 2,explore,coverage-fill,11,1,24,0,0,834,63.15,60.92,0.05,74,0,3,0.0,11.676,28.916,11.642,28.923
-Drone 3,explore,none,18,1,35,0,0,564,39.2,59.295,0.4,71,0,0,0.0,8.958,38.224,9.846,37.605
-Drone 4,explore,coverage-fill,11,1,22,0,0,424,48.7,60.878,0.05,60,0,3,0.0,37.712,14.732,37.736,14.7

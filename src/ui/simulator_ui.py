@@ -32,6 +32,7 @@ class SimulatorUI:
         self.shared_map_ax = None
         self.shared_map_image = None
         self.shared_robot_scatter = None
+        self.shared_landmark_scatter = None
         self.partition_image = None
         self.partition_generator_scatter = None
         self.partition_centroid_scatter = None
@@ -149,6 +150,7 @@ class SimulatorUI:
             extent=[0.0, WORLD_WIDTH_METERS, 0.0, WORLD_HEIGHT_METERS],
         )
         self.shared_robot_scatter = self.shared_map_ax.scatter([], [], s=28, c=[], edgecolors='black', linewidths=0.5)
+        self.shared_landmark_scatter = self.shared_map_ax.scatter([], [], s=52, marker='*', c='#FFCC00', edgecolors='black', linewidths=0.6)
 
         seed_box_ax = self.fig.add_axes([0.88, 0.19, 0.08, 0.05])
         self.seed_box = TextBox(seed_box_ax, 'Seed ', initial=str(self.sim.current_seed))
@@ -203,6 +205,17 @@ class SimulatorUI:
             colors = [d['color'] for d in self.sim.drones]
             self.shared_robot_scatter.set_offsets(offsets)
             self.shared_robot_scatter.set_facecolors(colors)
+        if self.shared_landmark_scatter is not None:
+            rows = list(getattr(self.sim, 'shared_known_landmarks', {}).values())
+            if rows:
+                offsets = [[float(r.get('x', 0.0)), float(r.get('y', 0.0))] for r in rows]
+                colors = ['#FFCC00' if str(r.get('color_name', r.get('color', 'yellow'))) == 'yellow' else '#FF8C00' for r in rows]
+                self.shared_landmark_scatter.set_offsets(offsets)
+                self.shared_landmark_scatter.set_facecolors(colors)
+                self.shared_landmark_scatter.set_sizes([52.0] * len(rows))
+            else:
+                self.shared_landmark_scatter.set_offsets([[0.0, 0.0]])
+                self.shared_landmark_scatter.set_sizes([0.0])
 
     def refresh_partition_overlay(self):
         visible = bool(self.sim.show_partition_overlay)
