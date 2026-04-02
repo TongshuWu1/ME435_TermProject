@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "run_label": "run_001_seed_124_20260402_100255",
+    "seed": 124,
+    "mission_mode": "auto_explore",
+    "auto_policy": "weighted_coverage",
+    "robot_count": 4,
+    "robot_names": [
+      "Drone 1",
+      "Drone 2",
+      "Drone 3",
+      "Drone 4"
+    ],
+    "sim_time_seconds": 62.499999999998586,
+    "auto_mode_enabled_at_save": false,
+    "saved_at": "2026-04-02T10:07:24"
+  },
+  "summary": {
+    "known_ratio": 1.0,
+    "free_coverage_ratio": 1.0,
+    "occupied_recall_ratio": 0.688496,
+    "frontier_count": 0,
+    "active_goals": 0,
+    "event_count": 470,
+    "coverage_samples": 121,
+    "auto_finished": true,
+    "last_saved_plot_path": "/home/tongshuwu/PycharmProjects/ME435_TermProject/outputs/run_001_seed_124_20260402_100255/trajectories_20260402_100723.png",
+    "last_saved_map_path": "/home/tongshuwu/PycharmProjects/ME435_TermProject/outputs/run_001_seed_124_20260402_100255/observed_maps_20260402_100723.png"
+  }
+}
