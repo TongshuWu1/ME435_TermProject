@@ -15,6 +15,16 @@ def robot_shape_from_pose(x, y, angle_deg, size):
 
 
 def make_fov_patch(x, y, angle_deg, color, view_distance=VIEW_DISTANCE, fov_angle=FOV_ANGLE):
+    if float(fov_angle) >= 359.9:
+        return patches.Circle(
+            (float(x), float(y)),
+            radius=float(view_distance),
+            facecolor=color,
+            alpha=0.08,
+            edgecolor=color,
+            linewidth=0.7,
+            zorder=3,
+        )
     return patches.Wedge(
         (x, y),
         float(view_distance),
@@ -29,13 +39,13 @@ def make_fov_patch(x, y, angle_deg, color, view_distance=VIEW_DISTANCE, fov_angl
 
 
 def update_fov_patch(patch, x, y, angle_deg, view_distance=VIEW_DISTANCE, fov_angle=FOV_ANGLE):
+    if isinstance(patch, patches.Circle):
+        patch.center = (float(x), float(y))
+        patch.radius = float(view_distance)
+        patch.stale = True
+        return patch
     theta1 = float(angle_deg) - float(fov_angle) / 2.0
     theta2 = float(angle_deg) + float(fov_angle) / 2.0
-
-    # Wedge caches its path internally. Direct attribute assignment leaves the
-    # cached path stale, which makes the cone appear frozen even though the robot
-    # state and vision rays keep updating. Use the patch setters so Matplotlib
-    # invalidates and rebuilds the wedge geometry.
     patch.set_center((float(x), float(y)))
     patch.set_radius(float(view_distance))
     patch.set_theta1(theta1)

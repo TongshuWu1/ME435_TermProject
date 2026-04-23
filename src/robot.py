@@ -1,7 +1,7 @@
 import math
 import numpy as np
 
-from config import WORLD_HEIGHT_METERS, WORLD_WIDTH_METERS
+from config import ROBOT_COLLISION_SUBSTEP, WORLD_HEIGHT_METERS, WORLD_WIDTH_METERS
 
 
 class Robot:
@@ -85,19 +85,30 @@ class Robot:
         closest_y = min(max(y, square['y'] - half), square['y'] + half)
         return math.hypot(x - closest_x, y - closest_y) <= radius
 
-    def collides(self, x, y, obstacles=None):
+    @staticmethod
+    def _collides_with_robot(x, y, radius, other):
+        other_radius = getattr(other, 'size', 0.0) / 2.0
+        return math.hypot(float(x) - float(other.x), float(y) - float(other.y)) <= (radius + other_radius)
+
+    def collides(self, x, y, obstacles=None, other_robots=None):
         if obstacles is None:
             obstacles = ()
+        if other_robots is None:
+            other_robots = ()
         radius = self.size / 2.0
         if x - radius < 0 or x + radius > WORLD_WIDTH_METERS:
             return True
         if y - radius < 0 or y + radius > WORLD_HEIGHT_METERS:
             return True
-        return any(self._collides_with_square(x, y, radius, obs) for obs in obstacles)
+        if any(self._collides_with_square(x, y, radius, obs) for obs in obstacles):
+            return True
+        return any(self._collides_with_robot(x, y, radius, other) for other in other_robots if other is not self)
 
-    def update(self, dt, obstacles=None):
+    def update(self, dt, obstacles=None, other_robots=None):
         if obstacles is None:
             obstacles = ()
+        if other_robots is None:
+            other_robots = ()
 
         vl = self.left_motor_speed
         vr = self.right_motor_speed
@@ -114,18 +125,28 @@ class Robot:
         delta_x = (v_noisy * math.cos(theta_rad) - lateral_noise * math.sin(theta_rad)) * dt
         delta_y = (v_noisy * math.sin(theta_rad) + lateral_noise * math.cos(theta_rad)) * dt
 
-        new_x = self.x + delta_x
-        new_y = self.y + delta_y
+        total_dist = math.hypot(delta_x, delta_y)
+        max_step = max(1e-6, float(ROBOT_COLLISION_SUBSTEP))
+        steps = max(1, int(math.ceil(total_dist / max_step)))
+        step_dx = delta_x / steps
+        step_dy = delta_y / steps
 
-        if not self.collides(new_x, new_y, obstacles):
-            self.x = new_x
-            self.y = new_y
-        else:
-            # Try sliding along one axis before giving up.
-            if not self.collides(new_x, self.y, obstacles):
-                self.x = new_x
-            elif not self.collides(self.x, new_y, obstacles):
-                self.y = new_y
+        for _ in range(steps):
+            cand_x = self.x + step_dx
+            cand_y = self.y + step_dy
+            if not self.collides(cand_x, cand_y, obstacles, other_robots):
+                self.x = cand_x
+                self.y = cand_y
+                continue
+            moved = False
+            if abs(step_dx) > 1e-9 and not self.collides(self.x + step_dx, self.y, obstacles, other_robots):
+                self.x = self.x + step_dx
+                moved = True
+            if abs(step_dy) > 1e-9 and not self.collides(self.x, self.y + step_dy, obstacles, other_robots):
+                self.y = self.y + step_dy
+                moved = True
+            if not moved:
+                break
 
         self.angle = (self.angle + math.degrees(omega_noisy * dt)) % 360.0
 
@@ -177,9 +198,11 @@ class Robot:
             distance = min(candidates) if candidates else view_distance
             results.append({
                 'angle_deg': ang_deg,
+                'rel_angle_deg': float(rel),
                 'distance': distance,
                 'hit_x': self.x + distance * dx,
                 'hit_y': self.y + distance * dy,
+                'is_obstacle_hit': bool(distance < view_distance - 1e-6),
             })
         return results
 

@@ -16,10 +16,14 @@ class Landmark:
         self.y = y
         self.shape = shape
         self.color_name = color  # Ensure this attribute is present
-        if color == "yellow":
-            self.color = '#FFCC00'
-        else:
-            self.color = '#FF8C00'
+        palette = {
+            "yellow": '#FFCC00',
+            "orange": '#FF8C00',
+            "cyan": '#2BCBFF',
+            "green": '#4CAF50',
+            "blue": '#4A90E2',
+        }
+        self.color = palette.get(color, color if isinstance(color, str) else '#FF8C00')
         self.size = size
 
     def draw(self, ax):

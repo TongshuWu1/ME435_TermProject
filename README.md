@@ -4,7 +4,6 @@
 - `main.py` — entry point
 - `config.py` — simulation constants
 - `src/` — source code
-- `outputs/` — saved run folders with PNG, CSV, and JSON summaries
 
 ## Source structure
 Top-level modules:
@@ -13,15 +12,12 @@ Top-level modules:
 - `src/planner.py` — occupancy-grid helpers and A* planning
 - `src/mapping_utils.py` — map update helpers
 - `src/environment.py` — obstacle and landmark generation
-- `src/output_utils.py` — saved trajectory and map figures
-- `src/reporting.py` — human-readable run summaries, CSV reports, and coverage progress plots
-- `src/paths.py` — project-root and output-folder helpers
 - `src/robot.py` — robot motion, collision checks, landmark detection, and obstacle scans
 - `src/localization.py` — EKF state estimator
 - `src/landmark.py` — landmark model
 
 Refactored subpackages:
-- `src/ui/simulator_ui.py` — Matplotlib canvas, buttons, selectors, and shared-map panel
+- `src/sim_ui.py` — Matplotlib canvas, buttons, selectors, and shared-map panel
 - `src/sim/rendering.py` — reusable robot / FOV / covariance ellipse rendering helpers
 - `src/sim/drone_factory.py` — drone creation and artist setup
 - `src/sim/partition_state.py` — cached partition / density overlay generation
@@ -29,7 +25,7 @@ Refactored subpackages:
 - `src/controllers/coverage_controller.py` — weighted Voronoi / centroid coverage controller
 
 Compatibility shim:
-- `src/sim_ui.py` — imports `SimulatorUI` from `src/ui/simulator_ui.py`
+- `src/sim_ui.py` — imports `SimulatorUI` from `src/sim_ui.py`
 
 ## Mission modes
 1. **Manual Click**
@@ -55,5 +51,5 @@ Compatibility shim:
 
 ## Notes
 - The simulator starts paused.
-- Each run saves a folder under `outputs/` containing trajectory/map PNGs plus `run_summary.txt`, `run_summary.json`, `robot_summary.csv`, `coverage_timeline.csv`, and `event_timeline.csv`.
+- The current baseline focuses on live simulation, local mapping, and monitoring windows rather than report-folder export.
 - Robot count is determined by `DRONE_NAMES` in `config.py`.

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from config import OWN_PATH_AVOID_GAIN, OWN_PATH_AVOID_RADIUS, TEAMMATE_PATH_AVOID_GAIN, TEAMMATE_PATH_AVOID_RADIUS
 from ..auto_explore import choose_frontier_goal_for_robot
 
 
@@ -32,6 +33,9 @@ class FrontierController:
         centroid_xy,
         teammate_positions,
         teammate_goal_positions,
+        own_recent_path=None,
+        teammate_path_histories=None,
+        partition_penalty_scale=1.0,
     ):
         return choose_frontier_goal_for_robot(
             robot_index,
@@ -57,4 +61,11 @@ class FrontierController:
             centroid_xy=centroid_xy,
             centroid_weight=self.centroid_weight,
             density_value_weight=self.density_value_weight,
+            own_recent_path=own_recent_path,
+            teammate_path_histories=teammate_path_histories,
+            partition_penalty_scale=partition_penalty_scale,
+            own_path_radius=OWN_PATH_AVOID_RADIUS,
+            own_path_gain=OWN_PATH_AVOID_GAIN,
+            teammate_path_radius=TEAMMATE_PATH_AVOID_RADIUS,
+            teammate_path_gain=TEAMMATE_PATH_AVOID_GAIN,
         )

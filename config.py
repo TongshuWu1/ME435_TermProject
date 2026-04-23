@@ -1,36 +1,73 @@
-# ------------------------------
-# World and timing
-# ------------------------------
+"""Project-wide configuration for the ME435 multi-robot exploration baseline.
+
+Only actively used settings are kept here. Values are grouped by subsystem so the
+file is easier to scan and tune.
+"""
+
+# ---------------------------------------------------------------------------
+# World
+# ---------------------------------------------------------------------------
 WORLD_WIDTH_METERS = 40
 WORLD_HEIGHT_METERS = 40
 TIME_STEP = 0.05
 RANDOM_SEED = 124
+BOUNDARY_MARGIN = 3.0
 
-# ------------------------------
-# Robot sensing and control
-# ------------------------------
-FOV_ANGLE = 120
+# ---------------------------------------------------------------------------
+# Robot sensing, communication, and local avoidance
+# ---------------------------------------------------------------------------
+FOV_ANGLE = 360
 VIEW_DISTANCE = 8
-VISION_RAY_COUNT = 12
-SHOW_VISION_RAYS = True
+VISION_RAY_COUNT = 48
+SHOW_VISION_RAYS = False
+
+ROBOT_RADIUS = 0.25
+COMMUNICATION_RADIUS = 18.0
+
 OBSTACLE_AVOID_DISTANCE = 1.5
 OBSTACLE_TURN_GAIN = 1.8
+ROBOT_AVOIDANCE_RADIUS = 1.6
+ROBOT_AVOIDANCE_GAIN = 1.4
+ROBOT_COLLISION_SUBSTEP = 0.08
+OWN_PATH_AVOID_RADIUS = 1.6
+OWN_PATH_AVOID_GAIN = 0.9
+TEAMMATE_PATH_AVOID_RADIUS = 2.0
+TEAMMATE_PATH_AVOID_GAIN = 1.1
 
-# ------------------------------
-# Planner and path display
-# ------------------------------
-A_STAR_GRID_RESOLUTION = 1.0
+PATH_HISTORY_PACKET_POINTS = 25
+TEAMMATE_PACKET_STALE_SECONDS = 6.0
+TEAMMATE_STALE_DECAY = 0.28
+TEAMMATE_TRACE_SCALE = 0.35
+TEAMMATE_MIN_RELIABILITY = 0.12
+INTERROBOT_USE_AS_LANDMARK = True
+INTERROBOT_MAX_REFERENCE_TRACE = 0.60
+INTERROBOT_MEASUREMENT_NOISE = [0.18, 2.2]
+INTERROBOT_NOISE_FROM_REFERENCE_TRACE_GAIN = 0.65
+
+# ---------------------------------------------------------------------------
+# Planning and path display
+# ---------------------------------------------------------------------------
+A_STAR_GRID_RESOLUTION = 0.5
 A_STAR_REPLAN_SECONDS = 2.6
 A_STAR_MIN_REPLAN_GAP_SECONDS = 0.75
 A_STAR_GOAL_TOLERANCE = 0.65
-A_STAR_LOOKAHEAD_STEPS = 1
-A_STAR_INFLATION_MARGIN = 1.20
+A_STAR_LOOKAHEAD_STEPS = 2
+A_STAR_CLEARANCE_MARGIN = 0.45
+A_STAR_INFLATION_MARGIN = ROBOT_RADIUS + A_STAR_CLEARANCE_MARGIN
+A_STAR_GOAL_CLEARANCE_CELLS = 3
+GOAL_OBSTACLE_CLEARANCE_METERS = 1.8
+GOAL_OBSTACLE_CLEARANCE_GAIN = 3.4
+SUBGOAL_OBSTACLE_CLEARANCE_METERS = 1.35
+SUBGOAL_CLEARANCE_PREFERENCE = 0.45
 KNOWN_MAP_REPLAN_ON_NEW_OBS = True
+
+A_STAR_PATH_CLEARANCE_WEIGHT = 0.55
+A_STAR_MIN_SEGMENT_CLEARANCE_METERS = 0.95
+
 PATH_LINE_WIDTH = 2.8
 TARGET_MARKER_SIZE = 15
 SUBGOAL_MARKER_SIZE = 9
 
-# Optional local A* debug overlay.
 SHOW_ASTAR_LOCAL_GRID = False
 A_STAR_GRID_WINDOW_CELLS = 4
 A_STAR_GRID_LINE_ALPHA = 0.14
@@ -39,47 +76,87 @@ A_STAR_GRID_PATH_ALPHA = 0.20
 A_STAR_GRID_UPDATE_FRAMES = 4
 A_STAR_GRID_MAX_DRONES = 1
 
-# Vision-ray styling.
 RAY_LINE_WIDTH = 1.3
 RAY_ALPHA = 0.55
 
-# ------------------------------
+# ---------------------------------------------------------------------------
 # State estimation
-# ------------------------------
-PREDICTION_NOISE = [0.02, 0.07, 0.5]
-MEASUREMENT_NOISE = [0.12, 2.5]
-MEASUREMENT_ALPHA = 0.35
+# ---------------------------------------------------------------------------
+PREDICTION_NOISE = [0.03, 0.03, 0.3]
+MEASUREMENT_NOISE = [0.2, 1.5]
+MEASUREMENT_ALPHA = 0.45
+# ---------------------------------------------------------------------------
+# Uncertainty-aware mapping
+# ---------------------------------------------------------------------------
+MAP_FREE_LOGODDS_DELTA = -0.70
+MAP_OCCUPIED_LOGODDS_DELTA = 1.20
+MAP_MIN_UPDATE_WEIGHT = 0.18
+MAP_POSE_TRACE_SCALE = 0.75
+MAP_RANGE_WEIGHT_GAIN = 0.55
+MAP_WEIGHT_HEADING_GAIN = 0.90
+MAP_POSE_UNCERTAINTY_HEADING_GAIN = 1.10
+MAP_POSE_UNCERTAINTY_RANGE_GAIN = 0.18
+MAP_POSE_UNCERTAINTY_FREE_DECAY = 0.55
+MAP_SOLIDIFY_LOGODDS = 1.5
+MAP_SOLIDIFY_CONFIDENCE = 0.8
+MAP_SCAN_BUFFER_SIZE = 180
+MAP_REPLAY_MAX_SCANS = 140
+ENABLE_RECENT_SCAN_REPLAY = True
+MAP_REPLAY_MIN_TRACE_IMPROVEMENT = 0.08
+MAP_REPLAY_MIN_POSITION_SHIFT = 0.12
+MAP_REPLAY_MIN_HEADING_SHIFT_DEG = 4.0
+MAP_UNCERTAINTY_VIS_METERS_SCALE = 0.75
 
-# ------------------------------
+# ---------------------------------------------------------------------------
 # Recovery / anti-stuck behavior
-# ------------------------------
+# ---------------------------------------------------------------------------
 STUCK_WINDOW_SECONDS = 2.0
 STUCK_PROGRESS_EPS = 0.8
 STUCK_RECOVERY_SECONDS = 1.3
 STUCK_REVERSE_SPEED = 0.45
 STUCK_TURN_SPEED = 2.8
 
-# ------------------------------
+# ---------------------------------------------------------------------------
 # Multi-robot setup
-# ------------------------------
+# ---------------------------------------------------------------------------
 ROBOT_COUNT = 4
-DRONE_NAME_PREFIX = "Drone"
-DRONE_NAMES = [f"{DRONE_NAME_PREFIX} {i + 1}" for i in range(ROBOT_COUNT)]
+DRONE_NAMES = [f"Drone {i + 1}" for i in range(ROBOT_COUNT)]
 DRONE_START_POSE = (WORLD_WIDTH_METERS / 2.0, 5.0, 90.0)
-DRONE_START_SPACING = 1.6
+DRONE_START_SPACING = 2.0
 START_SIMULATION_RUNNING = False
-OUTPUT_ROOT_DIR = "outputs"
 
-# ------------------------------
-# Automatic exploration / partition
-# ------------------------------
+# ---------------------------------------------------------------------------
+# Home base / spawn layout
+# ---------------------------------------------------------------------------
+HOME_BASE_WIDTH = 8.0
+HOME_BASE_HEIGHT = 4.0
+HOME_BASE_FORWARD_CLEARANCE = 2.0
+HOME_BASE_SPAWN_SLOT_MARGIN_X = 0.70
+HOME_BASE_SPAWN_FRONT_OFFSET = 0.85
+HOME_BASE_SPAWN_HEADING_FAN_DEGREES = 70.0
+HOME_BASE_STAGING_DISTANCE = 6.5
+HOME_BASE_DRAW_ALPHA = 0.16
+HOME_BASE_MARKER_SHAPE = "triangle"
+HOME_BASE_MARKER_COLOR = "cyan"
+HOME_BASE_MARKER_SIZE = 0.95
+RETURN_HOME_GOAL_TOLERANCE = 0.60
+RETURN_HOME_FINISH_HOLD_SECONDS = 1.5
+
+# ---------------------------------------------------------------------------
+# Automatic exploration and role selection baseline
+# ---------------------------------------------------------------------------
 DEFAULT_MISSION_MODE = 'manual_click'   # 'manual_click' or 'auto_explore'
+DEFAULT_AUTO_POLICY = 'weighted_coverage'  # 'frontier' or 'weighted_coverage'
+
 SHOW_PARTITION_OVERLAY_BY_DEFAULT = True
+SHOW_DENSITY_OVERLAY_BY_DEFAULT = False
+SHOW_UNCERTAINTY_OVERLAY_BY_DEFAULT = False
+
 AUTO_EXPLORE_REPLAN_SECONDS = 2.6
 AUTO_GOAL_MIN_HOLD_SECONDS = 3.0
 AUTO_GOAL_STALE_SECONDS = 7.5
 AUTO_GOAL_MIN_SWITCH_DISTANCE = 1.8
-AUTO_FRONTIER_MIN_COMPONENT_CELLS = 2
+AUTO_FRONTIER_MIN_COMPONENT_CELLS = 5
 AUTO_PARTITION_EPSILON_METERS = 0.45
 AUTO_GLOBAL_FRONTIER_FALLBACK = True
 AUTO_FRONTIER_TOP_K_CANDIDATES = 8
@@ -89,21 +166,31 @@ AUTO_FRONTIER_TEAMMATE_RADIUS = 4.0
 AUTO_FRONTIER_TEAMMATE_PENALTY = 2.75
 AUTO_FRONTIER_PROGRESS_WEIGHT = 0.55
 AUTO_FRONTIER_MIN_GOAL_DISTANCE = 1.05
+
 AUTO_LAUNCH_DISPERSAL_ENABLED = True
 AUTO_LAUNCH_DISPERSAL_DISTANCE = 5.6
 AUTO_LAUNCH_DISPERSAL_GOAL_TOLERANCE = 0.95
 AUTO_LAUNCH_DISPERSAL_MAX_SECONDS = 9.0
-AUTO_STOP_WHEN_FINISHED = True
-AUTO_FINISH_HOLD_SECONDS = 1.0
+AUTO_STARTUP_DISPERSION_MEAN_PAIRWISE_DISTANCE = 6.0
+AUTO_STARTUP_PARTITION_PENALTY_SCALE = 0.35
 
-SHOW_DENSITY_OVERLAY_BY_DEFAULT = False
+AUTO_STOP_WHEN_FINISHED = True
+AUTO_FINISH_HOLD_SECONDS = 2.0
+AUTO_FINISH_MIN_TOTAL_FRONTIER_CELLS = 8
+
+UI_HEAVY_REFRESH_EVERY_FRAMES = 4
+UI_SHARED_REFRESH_EVERY_FRAMES = 2
+UI_MONITOR_REFRESH_EVERY_FRAMES = 8
+UI_OVERLAY_REFRESH_EVERY_FRAMES = 8
+
 AUTO_DENSITY_FRONTIER_WEIGHT = 2.25
 AUTO_DENSITY_UNKNOWN_WEIGHT = 0.95
 AUTO_DENSITY_FREE_WEIGHT = 0.08
 AUTO_DENSITY_SMOOTHING_PASSES = 2
+
 AUTO_FRONTIER_CENTROID_WEIGHT = 0.32
 AUTO_FRONTIER_DENSITY_VALUE_WEIGHT = 0.85
-DEFAULT_AUTO_POLICY = 'weighted_coverage'  # 'frontier' or 'weighted_coverage'
+
 AUTO_COVERAGE_FALLBACK_GLOBAL = True
 AUTO_COVERAGE_TOP_K_CANDIDATES = 14
 AUTO_COVERAGE_DENSITY_GAIN = 1.85
@@ -120,32 +207,28 @@ AUTO_COVERAGE_FRONTIER_PROXIMITY_GAIN = 2.65
 AUTO_COVERAGE_NONMAX_RADIUS_CELLS = 3
 AUTO_COVERAGE_GLOBAL_FALLBACK_PENALTY = 1.6
 
-# ------------------------------
+# ---------------------------------------------------------------------------
 # Random environment generation
-# ------------------------------
-OBSTACLE_COUNT = 9
-OBSTACLE_SIZE_RANGE = (3.0, 5.0)
-OBSTACLE_CLEARANCE = 2.0
+# ---------------------------------------------------------------------------
+OBSTACLE_COUNT = 10
+OBSTACLE_SIZE_RANGE = (2.0, 4.0)
+OBSTACLE_CLEARANCE = 1.5
 
-LANDMARK_COUNT = 15
+LANDMARK_COUNT = 6
 LANDMARK_SIZE = 0.8
 LANDMARK_CLEARANCE = 1.3
 
-START_CLEAR_RADIUS = 5.5
-BOUNDARY_MARGIN = 3.0
+START_CLEAR_RADIUS = max(HOME_BASE_WIDTH / 2.0, HOME_BASE_HEIGHT) + HOME_BASE_FORWARD_CLEARANCE + 1.0
 
-
-
-# Mapping refinement: if a closed obstacle outline is observed,
-# fill its enclosed interior as occupied so obstacles become solid.
+# If a closed obstacle outline is observed, optionally fill the interior to
+# make obstacles appear solid in the occupancy map.
 FILL_ENCLOSED_OBSTACLE_INTERIORS = True
 ENCLOSED_FILL_MAX_CELLS = 160
 ENCLOSED_FILL_MIN_CELLS = 3
 ENCLOSED_FILL_SEAL_ONE_CELL_GAPS = True
 
-# Colors shared by multiple modules.
-COLOR_UNKNOWN = '#d9dde3'
-COLOR_FREE = '#f8fbff'
-COLOR_OCCUPIED = '#5b6470'
+# ---------------------------------------------------------------------------
+# Rendering colors
+# ---------------------------------------------------------------------------
 COLOR_OBSTACLE = '#5A5A5A'
 COLOR_BOUNDARY = 'red'

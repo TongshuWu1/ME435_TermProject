@@ -31,6 +31,13 @@ class OdometryEstimator:
         """Wrap an angle to [-180, 180)."""
         return (angle_deg + 180.0) % 360.0 - 180.0
 
+    @staticmethod
+    def _symmetrize_psd(mat, eps=1e-10):
+        mat = 0.5 * (np.asarray(mat, dtype=float) + np.asarray(mat, dtype=float).T)
+        eigvals, eigvecs = np.linalg.eigh(mat)
+        eigvals = np.maximum(eigvals, float(eps))
+        return eigvecs @ np.diag(eigvals) @ eigvecs.T
+
     def predict(self, u, dt, motion_noise_cov):
         """
         EKF prediction step.
@@ -95,11 +102,27 @@ class OdometryEstimator:
             )
 
         self.cov = G @ self.cov @ G.T + Q
-        self.cov = 0.5 * (self.cov + self.cov.T)
+        self.cov = self._symmetrize_psd(self.cov)
+
+    def _correct_single(self, z, z_hat, H, R_total):
+        I = np.eye(3)
+        y = np.asarray(z, dtype=float) - np.asarray(z_hat, dtype=float)
+        y[1] = self._wrap_angle_deg(y[1])
+
+        S = H @ self.cov @ H.T + R_total
+        S = self._symmetrize_psd(S)
+        K = self.cov @ H.T @ np.linalg.inv(S)
+
+        self.mu = self.mu + K @ y
+        self.mu[2] = self._wrap_angle_deg(self.mu[2])
+
+        KH = K @ H
+        self.cov = (I - KH) @ self.cov @ (I - KH).T + K @ R_total @ K.T
+        self.cov = self._symmetrize_psd(self.cov)
 
     def correct(self, measurements, measurement_noise_cov, alpha=1.0):
         """
-        EKF correction step using landmark range/bearing observations.
+        EKF correction step using fixed landmark range/bearing observations.
 
         Parameters
         ----------
@@ -120,10 +143,7 @@ class OdometryEstimator:
         if alpha <= 0.0:
             return
 
-        # Softer updates via noise inflation, instead of shrinking covariance too much
-        R_eff = R / alpha
-
-        I = np.eye(3)
+        R_eff = self._symmetrize_psd(R / alpha)
         rad_to_deg = 180.0 / np.pi
 
         for z_r, z_b, lm_x, lm_y in measurements:
@@ -135,7 +155,6 @@ class OdometryEstimator:
                 continue
 
             sqrt_q = np.sqrt(q)
-
             predicted_bearing = np.degrees(np.arctan2(dy, dx)) - self.mu[2]
             predicted_bearing = self._wrap_angle_deg(predicted_bearing)
             z_hat = np.array([sqrt_q, predicted_bearing], dtype=float)
@@ -145,20 +164,64 @@ class OdometryEstimator:
                 [ rad_to_deg * dy / q, -rad_to_deg * dx / q,     -1.0],
             ], dtype=float)
 
-            S = H @ self.cov @ H.T + R_eff
-            K = self.cov @ H.T @ np.linalg.inv(S)
+            z = np.array([float(z_r), float(z_b)], dtype=float)
+            self._correct_single(z, z_hat, H, R_eff)
+
+    def correct_with_uncertain_landmarks(self, measurements, measurement_noise_cov, alpha=1.0):
+        """
+        EKF correction using landmark position estimates with their own uncertainty.
+
+        Parameters
+        ----------
+        measurements : list of tuples
+            Each measurement is
+            (range_meas, bearing_meas_deg, landmark_x, landmark_y, landmark_cov_xy)
+            where landmark_cov_xy is a 2x2 covariance matrix for the landmark x-y pose.
+        measurement_noise_cov : 2x2 ndarray
+            Sensor covariance for [range (m), bearing (deg)].
+        alpha : float
+            Optional trust factor in (0, 1]. Lower values inflate the sensor noise.
+        """
+        R = np.asarray(measurement_noise_cov, dtype=float)
+        if R.shape != (2, 2):
+            raise ValueError("measurement_noise_cov must be 2x2")
+
+        alpha = float(alpha)
+        if alpha <= 0.0:
+            return
+
+        R_eff = self._symmetrize_psd(R / alpha)
+        rad_to_deg = 180.0 / np.pi
+
+        for z_r, z_b, lm_x, lm_y, lm_cov_xy in measurements:
+            dx = float(lm_x) - self.mu[0]
+            dy = float(lm_y) - self.mu[1]
+            q = dx * dx + dy * dy
+            if q < 1e-12:
+                continue
+
+            sqrt_q = np.sqrt(q)
+            predicted_bearing = np.degrees(np.arctan2(dy, dx)) - self.mu[2]
+            predicted_bearing = self._wrap_angle_deg(predicted_bearing)
+            z_hat = np.array([sqrt_q, predicted_bearing], dtype=float)
+
+            H_x = np.array([
+                [-dx / sqrt_q,            -dy / sqrt_q,            0.0],
+                [ rad_to_deg * dy / q, -rad_to_deg * dx / q,     -1.0],
+            ], dtype=float)
+            H_l = np.array([
+                [ dx / sqrt_q,             dy / sqrt_q],
+                [-rad_to_deg * dy / q,  rad_to_deg * dx / q],
+            ], dtype=float)
+
+            lm_cov_xy = np.asarray(lm_cov_xy, dtype=float)
+            if lm_cov_xy.shape != (2, 2):
+                raise ValueError("landmark_cov_xy must be 2x2")
+            lm_cov_xy = self._symmetrize_psd(lm_cov_xy)
+            R_total = self._symmetrize_psd(R_eff + H_l @ lm_cov_xy @ H_l.T)
 
             z = np.array([float(z_r), float(z_b)], dtype=float)
-            y = z - z_hat
-            y[1] = self._wrap_angle_deg(y[1])
-
-            self.mu = self.mu + K @ y
-            self.mu[2] = self._wrap_angle_deg(self.mu[2])
-
-            # Joseph-form covariance update
-            KH = K @ H
-            self.cov = (I - KH) @ self.cov @ (I - KH).T + K @ R_eff @ K.T
-            self.cov = 0.5 * (self.cov + self.cov.T)
+            self._correct_single(z, z_hat, H_x, R_total)
 
     def draw_uncertainty_ellipse(self, ax, n_std=2.0, **kwargs):
         """

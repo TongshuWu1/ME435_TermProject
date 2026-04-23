@@ -3,6 +3,8 @@ from collections import deque
 
 import numpy as np
 
+from config import GOAL_OBSTACLE_CLEARANCE_GAIN, GOAL_OBSTACLE_CLEARANCE_METERS, A_STAR_GOAL_CLEARANCE_CELLS
+
 
 def frontier_mask(known_grid, unknown_value, free_value):
     mask = np.zeros_like(known_grid, dtype=bool)
@@ -182,20 +184,83 @@ def _path_length(path):
     return total
 
 
+def _weighted_xy(source):
+    if isinstance(source, dict):
+        xy = source.get('xy', None)
+        if xy is None or len(xy) < 2:
+            return None
+        return float(xy[0]), float(xy[1]), float(source.get('weight', 1.0))
+    if isinstance(source, (list, tuple)):
+        if len(source) >= 3:
+            return float(source[0]), float(source[1]), float(source[2])
+        if len(source) >= 2:
+            return float(source[0]), float(source[1]), 1.0
+    return None
+
+
 def _teammate_penalty(xy, teammate_positions, teammate_goal_positions, radius, gain):
     if radius <= 1e-9 or gain <= 0.0:
         return 0.0
     penalty = 0.0
     inv_r2 = 1.0 / (radius * radius)
     for source in list(teammate_positions) + list(teammate_goal_positions):
-        dx = xy[0] - source[0]
-        dy = xy[1] - source[1]
+        parsed = _weighted_xy(source)
+        if parsed is None:
+            continue
+        sx, sy, weight = parsed
+        dx = xy[0] - sx
+        dy = xy[1] - sy
         d2 = dx * dx + dy * dy
         if d2 < radius * radius:
-            penalty += gain * math.exp(-1.6 * d2 * inv_r2)
+            penalty += float(weight) * gain * math.exp(-1.6 * d2 * inv_r2)
     return penalty
 
 
+def _path_history_penalty(xy, own_recent_path=None, teammate_path_histories=None, own_radius=0.0, own_gain=0.0, teammate_radius=0.0, teammate_gain=0.0):
+    penalty = 0.0
+    if own_recent_path and own_radius > 1e-9 and own_gain > 0.0:
+        inv_r2 = 1.0 / (own_radius * own_radius)
+        for px, py in own_recent_path:
+            dx = xy[0] - float(px)
+            dy = xy[1] - float(py)
+            d2 = dx * dx + dy * dy
+            if d2 < own_radius * own_radius:
+                penalty += own_gain * math.exp(-1.4 * d2 * inv_r2)
+    if teammate_path_histories and teammate_radius > 1e-9 and teammate_gain > 0.0:
+        inv_r2 = 1.0 / (teammate_radius * teammate_radius)
+        for history in teammate_path_histories:
+            if isinstance(history, dict):
+                points = history.get('points', [])
+                weight = float(history.get('weight', 1.0))
+            else:
+                points = history
+                weight = 1.0
+            for px, py in points:
+                dx = xy[0] - float(px)
+                dy = xy[1] - float(py)
+                d2 = dx * dx + dy * dy
+                if d2 < teammate_radius * teammate_radius:
+                    penalty += weight * teammate_gain * math.exp(-1.2 * d2 * inv_r2)
+    return penalty
+
+
+def _obstacle_clearance_penalty(xy, known_grid, occupied_value, world_to_grid_fn, grid_resolution, clearance_m, gain):
+    if clearance_m <= 1e-9 or gain <= 0.0:
+        return 0.0
+    gx, gy = world_to_grid_fn(float(xy[0]), float(xy[1]))
+    radius_cells = max(1, int(math.ceil(clearance_m / max(float(grid_resolution), 1e-9))))
+    best = None
+    for ny in range(max(0, gy - radius_cells), min(known_grid.shape[0], gy + radius_cells + 1)):
+        for nx in range(max(0, gx - radius_cells), min(known_grid.shape[1], gx + radius_cells + 1)):
+            if known_grid[ny, nx] != occupied_value:
+                continue
+            d = math.hypot((nx - gx) * grid_resolution, (ny - gy) * grid_resolution)
+            if best is None or d < best:
+                best = d
+    if best is None or best >= clearance_m:
+        return 0.0
+    ratio = max(0.0, 1.0 - best / clearance_m)
+    return gain * (ratio ** 2)
 def choose_frontier_goal_for_robot(
     robot_index,
     frontier_components,
@@ -220,6 +285,13 @@ def choose_frontier_goal_for_robot(
     centroid_xy=None,
     centroid_weight=0.0,
     density_value_weight=0.0,
+    own_recent_path=None,
+    teammate_path_histories=None,
+    partition_penalty_scale=1.0,
+    own_path_radius=0.0,
+    own_path_gain=0.0,
+    teammate_path_radius=0.0,
+    teammate_path_gain=0.0,
 ):
     teammate_positions = [] if teammate_positions is None else list(teammate_positions)
     teammate_goal_positions = [] if teammate_goal_positions is None else list(teammate_goal_positions)
@@ -245,7 +317,20 @@ def choose_frontier_goal_for_robot(
             centroid_cost = 0.0
             if centroid_xy is not None and np.all(np.isfinite(np.asarray(centroid_xy, dtype=float))):
                 centroid_cost = float(centroid_weight) * math.hypot(xy[0] - float(centroid_xy[0]), xy[1] - float(centroid_xy[1]))
-            quick_score = dist - info_gain * info_score - density_value_weight * density_value + teammate_cost + centroid_cost
+            path_history_cost = _path_history_penalty(
+                xy,
+                own_recent_path=own_recent_path,
+                teammate_path_histories=teammate_path_histories,
+                own_radius=own_path_radius,
+                own_gain=own_path_gain,
+                teammate_radius=teammate_path_radius,
+                teammate_gain=teammate_path_gain,
+            )
+            obstacle_clearance_cost = _obstacle_clearance_penalty(
+                xy, known_grid, occupied_value, grid_to_world_fn.__self__.world_to_grid if hasattr(grid_to_world_fn, '__self__') and hasattr(grid_to_world_fn.__self__, 'world_to_grid') else planner.world_to_grid,
+                planner.grid_resolution, GOAL_OBSTACLE_CLEARANCE_METERS, GOAL_OBSTACLE_CLEARANCE_GAIN,
+            )
+            quick_score = dist - info_gain * info_score - density_value_weight * density_value + teammate_cost + centroid_cost + path_history_cost + obstacle_clearance_cost
             meta = {
                 'xy': xy,
                 'cell': (gx, gy),
@@ -258,11 +343,13 @@ def choose_frontier_goal_for_robot(
                 'euclid_dist': dist,
                 'density_value': density_value,
                 'centroid_cost': centroid_cost,
+                'path_history_cost': path_history_cost,
+                'obstacle_clearance_cost': obstacle_clearance_cost,
             }
             if in_partition:
                 quick_candidates.append((quick_score, meta))
             elif fallback_global:
-                fallback_candidates.append((quick_score + partition_penalty, meta))
+                fallback_candidates.append((quick_score + partition_penalty * float(partition_penalty_scale), meta))
 
     candidate_pool = quick_candidates
     used_fallback = False
@@ -302,14 +389,14 @@ def choose_frontier_goal_for_robot(
     best_score = float('inf')
 
     for _, meta in candidate_pool[:limit]:
-        path = planner.astar(robot_xy, meta['xy'], known_grid, occupied_value)
+        path = planner.astar(robot_xy, meta['xy'], known_grid, occupied_value, goal_clearance_cells=A_STAR_GOAL_CLEARANCE_CELLS)
         if path is None:
             continue
         path_len = _path_length(path)
         progress_cost = progress_weight * max(0.0, path_len - meta['euclid_dist'])
-        final_score = path_len + progress_cost - info_gain * meta['info_score'] - density_value_weight * meta.get('density_value', 0.0) + meta['teammate_cost'] + meta.get('centroid_cost', 0.0)
+        final_score = path_len + progress_cost - info_gain * meta['info_score'] - density_value_weight * meta.get('density_value', 0.0) + meta['teammate_cost'] + meta.get('centroid_cost', 0.0) + meta.get('path_history_cost', 0.0) + meta.get('obstacle_clearance_cost', 0.0)
         if used_fallback and not meta['in_partition']:
-            final_score += partition_penalty
+            final_score += partition_penalty * float(partition_penalty_scale)
         if final_score < best_score:
             best_score = final_score
             best_goal = meta['xy']

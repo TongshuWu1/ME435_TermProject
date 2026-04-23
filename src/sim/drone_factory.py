@@ -10,15 +10,16 @@ from config import (
     SUBGOAL_MARKER_SIZE,
     TARGET_MARKER_SIZE,
     VISION_RAY_COUNT,
+    ROBOT_RADIUS,
 )
 from ..localization import OdometryEstimator
 from ..robot import Robot
 from .rendering import create_uncertainty_ellipse, make_fov_patch, robot_shape_from_pose
 
 
-def create_drone(ax, name, color, path, drone_index, start_pose, robot_seed_rng, planner_init_known_grid):
+def create_drone(ax, name, color, path, drone_index, start_pose, robot_seed_rng, planner_init_known_grid, planner_world_to_grid):
     start_x, start_y, start_angle = start_pose
-    robot = Robot(x=start_x, y=start_y, angle=start_angle, rng=robot_seed_rng)
+    robot = Robot(x=start_x, y=start_y, angle=start_angle, size=2.0 * ROBOT_RADIUS, rng=robot_seed_rng)
     odometry = OdometryEstimator(
         init_pos=[start_x, start_y, start_angle],
         init_cov=np.diag([0.1, 0.1, 1.0]),
@@ -139,7 +140,7 @@ def create_drone(ax, name, color, path, drone_index, start_pose, robot_seed_rng,
         'known_occ_count': 0,
         'local_known_occ_count': 0,
         'just_discovered_obstacle': False,
-        'recent_positions': [(0.0, start_x, start_y)],
+        'recent_positions': [(0.0, float(odometry.mu[0]), float(odometry.mu[1]))],
         'recovery_until': -1e9,
         'recovery_turn_sign': 1.0,
         'last_scan_bias': 1.0,
@@ -156,5 +157,5 @@ def create_drone(ax, name, color, path, drone_index, start_pose, robot_seed_rng,
         'distance_travelled': 0.0,
         'idle_time': 0.0,
         'last_goal_type': 'none',
-        'visited_cells': {(int(round(start_x)), int(round(start_y)))},
+        'visited_cells': {planner_world_to_grid(float(odometry.mu[0]), float(odometry.mu[1]))},
     }

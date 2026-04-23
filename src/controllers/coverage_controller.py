@@ -4,6 +4,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from config import OWN_PATH_AVOID_GAIN, OWN_PATH_AVOID_RADIUS, TEAMMATE_PATH_AVOID_GAIN, TEAMMATE_PATH_AVOID_RADIUS, GOAL_OBSTACLE_CLEARANCE_GAIN, GOAL_OBSTACLE_CLEARANCE_METERS, A_STAR_GOAL_CLEARANCE_CELLS
+from ..auto_explore import _teammate_penalty, _path_history_penalty, _obstacle_clearance_penalty
+
 
 def _path_length(path):
     if not path or len(path) < 2:
@@ -12,26 +15,6 @@ def _path_length(path):
     for p0, p1 in zip(path[:-1], path[1:]):
         total += math.hypot(p1[0] - p0[0], p1[1] - p0[1])
     return total
-
-
-def _teammate_penalty(xy, teammate_positions, teammate_goal_positions, radius, gain, goal_gain_scale=1.35):
-    if radius <= 1e-9 or gain <= 0.0:
-        return 0.0
-    penalty = 0.0
-    inv_r2 = 1.0 / (radius * radius)
-    for source in teammate_positions:
-        dx = xy[0] - source[0]
-        dy = xy[1] - source[1]
-        d2 = dx * dx + dy * dy
-        if d2 < radius * radius:
-            penalty += gain * math.exp(-1.4 * d2 * inv_r2)
-    for source in teammate_goal_positions:
-        dx = xy[0] - source[0]
-        dy = xy[1] - source[1]
-        d2 = dx * dx + dy * dy
-        if d2 < radius * radius:
-            penalty += (goal_gain_scale * gain) * math.exp(-1.2 * d2 * inv_r2)
-    return penalty
 
 
 @dataclass
@@ -169,6 +152,9 @@ class WeightedCoverageController:
         teammate_positions,
         teammate_goal_positions,
         visited_cells=None,
+        own_recent_path=None,
+        teammate_path_histories=None,
+        partition_penalty_scale=1.0,
     ):
         known_grid = np.asarray(known_grid)
         density_map = np.asarray(density_map, dtype=float)
@@ -234,6 +220,19 @@ class WeightedCoverageController:
                 self.teammate_penalty,
             )
 
+            path_history_cost = _path_history_penalty(
+                xy,
+                own_recent_path=own_recent_path,
+                teammate_path_histories=teammate_path_histories,
+                own_radius=OWN_PATH_AVOID_RADIUS,
+                own_gain=OWN_PATH_AVOID_GAIN,
+                teammate_radius=TEAMMATE_PATH_AVOID_RADIUS,
+                teammate_gain=TEAMMATE_PATH_AVOID_GAIN,
+            )
+            obstacle_clearance_cost = _obstacle_clearance_penalty(
+                xy, known_grid, occupied_value, world_to_grid_fn, planner.grid_resolution, GOAL_OBSTACLE_CLEARANCE_METERS, GOAL_OBSTACLE_CLEARANCE_GAIN
+            )
+
             quick_score = (
                 self.density_gain * density_value
                 + self.local_mass_gain * local_mass
@@ -247,9 +246,11 @@ class WeightedCoverageController:
                 - self.robot_distance_weight * dist_robot
                 - self.revisit_penalty_gain * revisit_mass
                 - teammate_cost
+                - path_history_cost
+                - obstacle_clearance_cost
             )
             if using_global and partition_labels[gy, gx] != int(robot_index):
-                quick_score -= float(self.global_fallback_penalty)
+                quick_score -= float(self.global_fallback_penalty) * float(partition_penalty_scale)
 
             candidates.append((quick_score, {
                 'cell': (int(gx), int(gy)),
@@ -267,6 +268,8 @@ class WeightedCoverageController:
                 'frontier_proximity': frontier_proximity,
                 'cluster_gain': cluster_gain,
                 'in_partition': bool(partition_labels[gy, gx] == int(robot_index)),
+                'path_history_cost': path_history_cost,
+                'obstacle_clearance_cost': obstacle_clearance_cost,
             }))
 
         if not candidates:
@@ -298,6 +301,19 @@ class WeightedCoverageController:
                         self.teammate_penalty,
                     )
                     anchor_boost = 0.25 * self.density_gain * density_value + 0.10 * self.local_mass_gain * local_mass
+                    path_history_cost = _path_history_penalty(
+                        xy,
+                        own_recent_path=own_recent_path,
+                        teammate_path_histories=teammate_path_histories,
+                        own_radius=OWN_PATH_AVOID_RADIUS,
+                        own_gain=OWN_PATH_AVOID_GAIN,
+                        teammate_radius=TEAMMATE_PATH_AVOID_RADIUS,
+                        teammate_gain=TEAMMATE_PATH_AVOID_GAIN,
+                    )
+                    obstacle_clearance_cost = _obstacle_clearance_penalty(
+                        xy, known_grid, occupied_value, world_to_grid_fn, planner.grid_resolution, GOAL_OBSTACLE_CLEARANCE_METERS, GOAL_OBSTACLE_CLEARANCE_GAIN
+                    )
+
                     quick_score = (
                         anchor_boost
                         + 0.25 * self.frontier_contact_gain * float(unknown_contacts)
@@ -308,6 +324,8 @@ class WeightedCoverageController:
                         - 0.35 * self.robot_distance_weight * dist_robot
                         - 0.50 * self.revisit_penalty_gain * revisit_mass
                         - 0.55 * teammate_cost
+                        - path_history_cost
+                        - obstacle_clearance_cost
                     )
                     candidates.append((quick_score, {
                         'cell': (int(gx), int(gy)),
@@ -326,6 +344,8 @@ class WeightedCoverageController:
                         'cluster_gain': cluster_gain,
                         'in_partition': bool(partition_labels[gy, gx] == int(robot_index)),
                         'anchor_candidate': True,
+                        'path_history_cost': path_history_cost,
+                        'obstacle_clearance_cost': obstacle_clearance_cost,
                     }))
 
         candidates.sort(key=lambda item: item[0], reverse=True)
@@ -367,6 +387,9 @@ class WeightedCoverageController:
         teammate_goal_positions,
         frontier_components,
         visited_cells=None,
+        own_recent_path=None,
+        teammate_path_histories=None,
+        partition_penalty_scale=1.0,
     ):
         if not frontier_components:
             return None, None
@@ -392,6 +415,9 @@ class WeightedCoverageController:
             teammate_positions=teammate_positions,
             teammate_goal_positions=teammate_goal_positions,
             visited_cells=visited_cells,
+            own_recent_path=own_recent_path,
+            teammate_path_histories=teammate_path_histories,
+            partition_penalty_scale=partition_penalty_scale,
         )
         if not candidates:
             return None, None
@@ -400,7 +426,7 @@ class WeightedCoverageController:
         best_meta = None
         best_score = float('inf')
         for meta in candidates:
-            path = planner.astar(robot_xy, meta['xy'], known_grid, occupied_value)
+            path = planner.astar(robot_xy, meta['xy'], known_grid, occupied_value, goal_clearance_cells=A_STAR_GOAL_CLEARANCE_CELLS)
             if path is None:
                 continue
             path_len = _path_length(path)
@@ -419,9 +445,11 @@ class WeightedCoverageController:
                 - self.frontier_proximity_gain * meta['frontier_proximity']
                 + self.revisit_penalty_gain * float(meta.get('revisit_mass', 0.0))
                 + meta['teammate_cost']
+                + float(meta.get('path_history_cost', 0.0))
+                + float(meta.get('obstacle_clearance_cost', 0.0))
             )
             if not meta.get('in_partition', True):
-                score += float(self.global_fallback_penalty)
+                score += float(self.global_fallback_penalty) * float(partition_penalty_scale)
             if score < best_score:
                 best_score = score
                 best_goal = meta['xy']

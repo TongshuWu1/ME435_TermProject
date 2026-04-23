@@ -1,6 +1,6 @@
-from datetime import datetime
 import json
 import math
+from collections import deque
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
@@ -16,6 +16,7 @@ from config import (
     A_STAR_GRID_UPDATE_FRAMES,
     A_STAR_GRID_WINDOW_CELLS,
     A_STAR_INFLATION_MARGIN,
+    A_STAR_GOAL_CLEARANCE_CELLS,
     A_STAR_LOOKAHEAD_STEPS,
     A_STAR_REPLAN_SECONDS,
     A_STAR_MIN_REPLAN_GAP_SECONDS,
@@ -35,6 +36,8 @@ from config import (
     AUTO_LAUNCH_DISPERSAL_ENABLED,
     AUTO_LAUNCH_DISPERSAL_GOAL_TOLERANCE,
     AUTO_LAUNCH_DISPERSAL_MAX_SECONDS,
+    AUTO_STARTUP_DISPERSION_MEAN_PAIRWISE_DISTANCE,
+    AUTO_STARTUP_PARTITION_PENALTY_SCALE,
     AUTO_STOP_WHEN_FINISHED,
     AUTO_FINISH_HOLD_SECONDS,
     AUTO_DENSITY_FRONTIER_WEIGHT,
@@ -67,12 +70,39 @@ from config import (
     DRONE_NAMES,
     DRONE_START_POSE,
     DRONE_START_SPACING,
+    HOME_BASE_DRAW_ALPHA,
+    HOME_BASE_HEIGHT,
+    HOME_BASE_MARKER_COLOR,
+    HOME_BASE_MARKER_SHAPE,
+    HOME_BASE_MARKER_SIZE,
+    HOME_BASE_SPAWN_SLOT_MARGIN_X,
+    HOME_BASE_SPAWN_FRONT_OFFSET,
+    HOME_BASE_SPAWN_HEADING_FAN_DEGREES,
+    HOME_BASE_STAGING_DISTANCE,
+    HOME_BASE_WIDTH,
     FOV_ANGLE,
     KNOWN_MAP_REPLAN_ON_NEW_OBS,
     MEASUREMENT_ALPHA,
     MEASUREMENT_NOISE,
-    OBSTACLE_AVOID_DISTANCE,
-    OBSTACLE_TURN_GAIN,
+    MAP_REPLAY_MIN_HEADING_SHIFT_DEG,
+    MAP_REPLAY_MIN_POSITION_SHIFT,
+    MAP_REPLAY_MIN_TRACE_IMPROVEMENT,
+    ENABLE_RECENT_SCAN_REPLAY,
+    MAP_SCAN_BUFFER_SIZE,
+    MAP_REPLAY_MAX_SCANS,
+    COMMUNICATION_RADIUS,
+    ROBOT_AVOIDANCE_RADIUS,
+    ROBOT_AVOIDANCE_GAIN,
+    ROBOT_RADIUS,
+    PATH_HISTORY_PACKET_POINTS,
+    TEAMMATE_PACKET_STALE_SECONDS,
+    TEAMMATE_STALE_DECAY,
+    TEAMMATE_TRACE_SCALE,
+    TEAMMATE_MIN_RELIABILITY,
+    INTERROBOT_USE_AS_LANDMARK,
+    INTERROBOT_MAX_REFERENCE_TRACE,
+    INTERROBOT_MEASUREMENT_NOISE,
+    INTERROBOT_NOISE_FROM_REFERENCE_TRACE_GAIN,
     PATH_LINE_WIDTH,
     PREDICTION_NOISE,
     RANDOM_SEED,
@@ -80,8 +110,13 @@ from config import (
     RAY_LINE_WIDTH,
     SHOW_ASTAR_LOCAL_GRID,
     SHOW_DENSITY_OVERLAY_BY_DEFAULT,
+    SHOW_UNCERTAINTY_OVERLAY_BY_DEFAULT,
+    MAP_UNCERTAINTY_VIS_METERS_SCALE,
+    AUTO_FINISH_MIN_TOTAL_FRONTIER_CELLS,
     SHOW_PARTITION_OVERLAY_BY_DEFAULT,
     SHOW_VISION_RAYS,
+    RETURN_HOME_FINISH_HOLD_SECONDS,
+    RETURN_HOME_GOAL_TOLERANCE,
     START_SIMULATION_RUNNING,
     STUCK_PROGRESS_EPS,
     STUCK_RECOVERY_SECONDS,
@@ -89,21 +124,36 @@ from config import (
     STUCK_TURN_SPEED,
     STUCK_WINDOW_SECONDS,
     SUBGOAL_MARKER_SIZE,
+    SUBGOAL_OBSTACLE_CLEARANCE_METERS,
+    SUBGOAL_CLEARANCE_PREFERENCE,
     TARGET_MARKER_SIZE,
+    UI_HEAVY_REFRESH_EVERY_FRAMES,
+    UI_SHARED_REFRESH_EVERY_FRAMES,
+    UI_MONITOR_REFRESH_EVERY_FRAMES,
+    UI_OVERLAY_REFRESH_EVERY_FRAMES,
     TIME_STEP,
     VIEW_DISTANCE,
     VISION_RAY_COUNT,
     WORLD_HEIGHT_METERS,
     WORLD_WIDTH_METERS,
 )
-from .environment import empty_target_sequences, generate_environment, square_contains_point
+from .environment import empty_target_sequences, generate_environment, square_contains_point, home_base_region
 from .auto_explore import partition_generators_from_positions
 from .controllers import FrontierController, WeightedCoverageController
 from .landmark import Landmark
-from .mapping_utils import apply_scan_to_grid, clearance_groups, reveal_start_area, update_known_map_from_scan
-from .output_utils import save_map_outputs, save_trajectory_png, write_run_metadata
-from .reporting import compute_coverage_metrics, polyline_length, save_run_reports
-from .paths import output_root, run_output_dir
+from .mapping_utils import (
+    apply_scan_to_grid,
+    clearance_groups,
+    initialize_belief_grids,
+    initialize_pose_uncertainty_grid,
+    reveal_start_area,
+    reveal_start_area_with_belief,
+    scan_buffer_entry_from_scan,
+    scan_from_buffer_entry,
+    shifted_scan_buffer_entry,
+    update_known_map_from_scan,
+)
+from .metrics import compute_coverage_metrics, polyline_length
 from .planner import GridPlanner
 from .sim.drone_factory import create_drone
 from .sim.partition_state import compute_partition_state
@@ -114,9 +164,9 @@ from .sim.rendering import (
     update_fov_patch,
     update_uncertainty_ellipse_patch,
 )
-from .ui.simulator_ui import SimulatorUI
+from .sim_ui import SimulatorUI
 
-RENDER_FPS = 30
+RENDER_FPS = 20
 UNKNOWN = 0
 FREE = 1
 OCCUPIED = 2
@@ -125,14 +175,14 @@ class Simulator:
     def __init__(self):
         self.current_seed = RANDOM_SEED
         self.run_index = 0
-        self.current_run_label = ''
-        self.current_run_dir = None
-        self._saved_current_run = False
+        self.session_label = 'session'
         self.landmark_patches = []
         self.obstacle_patches = []
         self.landmarks = []
         self.shared_known_landmarks = {}
         self.obstacles = []
+        self.home_base = home_base_region()
+        self.home_base_patch = None
         self.fov_angle = FOV_ANGLE
         self.view_distance = VIEW_DISTANCE
         self.auto_mode = START_SIMULATION_RUNNING
@@ -141,6 +191,11 @@ class Simulator:
         self.time_elapsed = 0.0
         self.auto_finished = False
         self.auto_finish_candidate_time = None
+        self.return_phase_active = False
+        self.return_finish_candidate_time = None
+        self.shared_los_segments = []
+        self._planning_occupancy_version = 0
+        self._planning_occ_cache_frame = {}
 
         self.grid_resolution = A_STAR_GRID_RESOLUTION
         self.planner = GridPlanner(A_STAR_GRID_RESOLUTION, A_STAR_INFLATION_MARGIN)
@@ -148,14 +203,19 @@ class Simulator:
         self.ny = self.planner.ny
         self.truth_occupancy = self._build_truth_occupancy_grid()
         self.shared_known_grid = self._init_known_grid()
+        self.shared_logodds_grid, self.shared_confidence_grid = self._init_belief_layers(self.shared_known_grid)
+        self.shared_pose_uncertainty_grid = self._init_pose_uncertainty_grid(self.shared_known_grid)
         self.mission_mode = DEFAULT_MISSION_MODE
         self.auto_policy = DEFAULT_AUTO_POLICY
         self.show_partition_overlay = SHOW_PARTITION_OVERLAY_BY_DEFAULT
         self.show_density_overlay = SHOW_DENSITY_OVERLAY_BY_DEFAULT
+        self.show_uncertainty_overlay = SHOW_UNCERTAINTY_OVERLAY_BY_DEFAULT
         self.partition_labels = -np.ones((self.ny, self.nx), dtype=int)
         self.partition_rgba = np.zeros((self.ny, self.nx, 4), dtype=float)
         self.density_map = np.zeros((self.ny, self.nx), dtype=float)
         self.density_rgba = np.zeros((self.ny, self.nx, 4), dtype=float)
+        self.uncertainty_rgba = np.zeros((self.ny, self.nx, 4), dtype=float)
+        self._shared_uncertainty_dirty = True
         self.partition_generators_xy = np.zeros((0, 2), dtype=float)
         self.partition_centroids_xy = np.zeros((0, 2), dtype=float)
         self.partition_generator_colors = []
@@ -164,11 +224,10 @@ class Simulator:
         self._last_partition_generators = None
         self.auto_finished = False
         self.auto_finish_candidate_time = None
+        self.shared_los_segments = []
 
         self.selected_drone_index = 0
         self.edit_mode = 'add_waypoint'
-        self.last_saved_plot_path = ''
-        self.last_saved_map_path = ''
         self.event_log = []
         self.coverage_history = []
         self._last_coverage_sample_time = -1e9
@@ -237,8 +296,23 @@ class Simulator:
             drone_name = DRONE_NAMES[idx] if idx < len(DRONE_NAMES) else f'Drone {idx + 1}'
             color = self.colors[idx]
             drone = self._create_drone(drone_name, color, path, drone_index=idx, drone_count=len(self.generated_target_sequences))
-            self._reveal_start_area(drone['local_known_grid'], drone['robot'].x, drone['robot'].y)
-            self._reveal_start_area(self.shared_known_grid, drone['robot'].x, drone['robot'].y)
+            drone['local_pose_uncertainty_grid'] = self._init_pose_uncertainty_grid(drone['local_known_grid'])
+            self._reveal_start_area_with_belief(
+                drone['local_known_grid'],
+                drone['local_logodds_grid'],
+                drone['local_confidence_grid'],
+                drone['local_pose_uncertainty_grid'],
+                drone['robot'].x,
+                drone['robot'].y,
+            )
+            self._reveal_start_area_with_belief(
+                self.shared_known_grid,
+                self.shared_logodds_grid,
+                self.shared_confidence_grid,
+                self.shared_pose_uncertainty_grid,
+                drone['robot'].x,
+                drone['robot'].y,
+            )
             self.drones.append(drone)
 
         legend_handles = [
@@ -247,8 +321,14 @@ class Simulator:
         ]
         self.ax.legend(handles=legend_handles, loc='upper left')
         self._sync_paths_for_mode()
+        self._mark_shared_uncertainty_dirty()
+        for _dr in self.drones:
+            self._mark_local_uncertainty_dirty(_dr)
         self._refresh_partition_state()
+        self._update_los_and_packets()
+        self.ui.build_robot_monitor(self.drones)
         self.ui.refresh_all()
+        self.ui.refresh_robot_monitor()
 
     def _refresh_toggle_button(self):
         self.ui.refresh_toggle_button()
@@ -261,6 +341,13 @@ class Simulator:
 
     def _mark_partition_dirty(self):
         self._partition_dirty = True
+
+    def _mark_shared_uncertainty_dirty(self):
+        self._shared_uncertainty_dirty = True
+
+    @staticmethod
+    def _mark_local_uncertainty_dirty(drone):
+        drone['local_uncertainty_dirty'] = True
 
     def _reset_reporting_state(self):
         self.event_log = []
@@ -282,7 +369,7 @@ class Simulator:
             'data_json': json.dumps(data, sort_keys=True) if data else '',
         }
         self.event_log.append(record)
-        prefix = f"[{self.current_run_label or 'run'} t={self.time_elapsed:6.2f}s]"
+        prefix = f"[{self.session_label} t={self.time_elapsed:6.2f}s]"
         if robot_name:
             prefix += f" [{robot_name}]"
         print(f"{prefix} {message}")
@@ -343,7 +430,7 @@ class Simulator:
         mission_name = 'auto explore' if self.mission_mode == 'auto_explore' else 'manual click'
         policy_name = 'weighted coverage' if self.auto_policy == 'weighted_coverage' else 'frontier'
         print(
-            f"[{self.current_run_label or 'run'} | t={self.time_elapsed:6.2f}s] "
+            f"[{self.session_label} | t={self.time_elapsed:6.2f}s] "
             f"mode={mission_name}, policy={policy_name}, "
             f"map_known={100.0 * metrics['known_ratio']:5.1f}%, "
             f"free_covered={100.0 * metrics['free_coverage_ratio']:5.1f}%, "
@@ -483,6 +570,7 @@ class Simulator:
                 f'Replan attempts: {drone.get("replan_count", 0)}    Stuck: {drone.get("stuck_events", 0)}',
                 f'Landmk  : {len(drone.get("known_landmarks", {}))} local, {len(drone.get("last_detected_landmarks", []))} vis',
                 f'Updates : {drone.get("measurement_update_count", 0)} corr    Last: {last_landmark}',
+                f'LOS Peers: {len(drone.get("visible_teammates", []))} -> {', '.join(drone.get("visible_teammates", [])[:3]) if drone.get("visible_teammates", []) else '-'}',
             ])
         return '\n'.join(lines)
 
@@ -500,6 +588,9 @@ class Simulator:
             self._update_mission_artist(drone)
         self.auto_finished = False
         self.auto_finish_candidate_time = None
+        self.return_phase_active = False
+        self.return_finish_candidate_time = None
+        self.shared_los_segments = []
         self._mark_partition_dirty()
 
     def on_select_mission_mode(self, label):
@@ -508,6 +599,7 @@ class Simulator:
         self._sync_paths_for_mode()
         self.auto_finished = False
         self.auto_finish_candidate_time = None
+        self.shared_los_segments = []
         self._log_event('mission_mode_changed', f"Mission mode set to {self.mission_mode.replace('_', ' ')}")
         self._refresh_control_text()
         self._refresh_partition_state(force=True)
@@ -527,6 +619,7 @@ class Simulator:
                 self._update_mission_artist(drone)
         self.auto_finished = False
         self.auto_finish_candidate_time = None
+        self.shared_los_segments = []
         self._log_event('auto_policy_changed', f"Auto policy set to {self.auto_policy.replace('_', ' ')}")
         self._refresh_control_text()
         self.fig.canvas.draw_idle()
@@ -556,8 +649,18 @@ class Simulator:
         self.ui.refresh_partition_overlay()
         self.fig.canvas.draw_idle()
 
+    def toggle_uncertainty_overlay(self, event=None):
+        self.show_uncertainty_overlay = not self.show_uncertainty_overlay
+        self._refresh_uncertainty_button()
+        self.ui.refresh_partition_overlay()
+        self.ui.refresh_robot_monitor()
+        self.fig.canvas.draw_idle()
+
     def _refresh_density_button(self):
         self.ui.refresh_density_button()
+
+    def _refresh_uncertainty_button(self):
+        self.ui.refresh_uncertainty_button()
 
     def _toolbar_active(self):
         toolbar = getattr(self.fig.canvas, 'toolbar', None)
@@ -598,20 +701,24 @@ class Simulator:
         drone['path_progress_index'] = 0
         drone['plan_line'].set_data([x], [y])
         drone['subgoal_marker'].set_data([x] if drone['path'] else [], [y] if drone['path'] else [])
-        self._reveal_start_area(drone['local_known_grid'], x, y)
-        self._reveal_start_area(self.shared_known_grid, x, y)
+        drone['local_logodds_grid'], drone['local_confidence_grid'] = self._init_belief_layers(drone['local_known_grid'])
+        drone['local_pose_uncertainty_grid'] = self._init_pose_uncertainty_grid(drone['local_known_grid'])
+        drone['recent_scan_buffer'] = deque(maxlen=MAP_SCAN_BUFFER_SIZE)
+        self._reveal_start_area_with_belief(drone['local_known_grid'], drone['local_logodds_grid'], drone['local_confidence_grid'], drone['local_pose_uncertainty_grid'], x, y)
+        self._reveal_start_area_with_belief(self.shared_known_grid, self.shared_logodds_grid, self.shared_confidence_grid, self.shared_pose_uncertainty_grid, x, y)
         drone['trace_x'] = [x]
         drone['trace_y'] = [y]
         drone['est_trace_x'] = [x]
         drone['est_trace_y'] = [y]
         drone['trace_line'].set_data(drone['trace_x'], drone['trace_y'])
         drone['est_trace_line'].set_data(drone['est_trace_x'], drone['est_trace_y'])
-        drone['recent_positions'] = [(self.time_elapsed, x, y)]
+        drone['recent_positions'] = [(self.time_elapsed, *self._estimated_xy(drone))]
         drone['just_discovered_obstacle'] = True
         drone['last_command_active'] = False
         drone['distance_travelled'] = 0.0
         drone['idle_time'] = 0.0
-        drone['visited_cells'] = {self._world_to_grid(x, y)}
+        drone['visited_cells'] = {self._estimated_grid_cell(drone)}
+        drone['last_pose_trace'] = float(np.trace(drone['odometry'].cov[:2, :2]))
         self._update_mission_artist(drone)
         drone['true_patch'].set_xy(self.robot_shape_from_pose(x, y, angle, robot.size))
         drone['est_patch'].set_xy(self.robot_shape_from_pose(x, y, angle, robot.size * 0.92))
@@ -619,7 +726,6 @@ class Simulator:
         update_fov_patch(drone['fov_patch'], x, y, angle, view_distance=self.view_distance, fov_angle=self.fov_angle)
         for line in drone['ray_lines']:
             line.set_data([x, x], [y, y])
-        self._saved_current_run = False
         self._mark_partition_dirty()
         self._refresh_partition_state(force=True)
 
@@ -654,7 +760,6 @@ class Simulator:
             drone['last_plan_time'] = -1e9
             drone['just_discovered_obstacle'] = True
             self._log_event('manual_waypoint_added', f"Manual waypoint added at ({float(x):.2f}, {float(y):.2f})", drone=drone, x=float(x), y=float(y), waypoint_count=len(drone['manual_path']))
-        self._saved_current_run = False
         self.ui.refresh_all()
         self.fig.canvas.draw_idle()
 
@@ -693,260 +798,70 @@ class Simulator:
         drone['subgoal_marker'].set_data([], [])
         drone['last_goal_type'] = 'none'
         self._update_mission_artist(drone)
-        self._saved_current_run = False
         self._mark_partition_dirty()
         self._refresh_partition_state(force=True)
+        self._update_los_and_packets()
         self.ui.refresh_shared_map()
+        self.ui.refresh_robot_monitor()
         self._log_event('path_cleared', 'Cleared path and current goal', drone=drone)
         self.fig.canvas.draw_idle()
 
     def _save_outputs(self):
-        self._finalize_current_run()
-
-    def _run_metadata(self):
-        return {
-            'run_label': self.current_run_label,
-            'seed': int(self.current_seed),
-            'mission_mode': self.mission_mode,
-            'auto_policy': self.auto_policy,
-            'robot_count': len(getattr(self, 'drones', [])),
-            'robot_names': [drone['name'] for drone in getattr(self, 'drones', [])],
-            'sim_time_seconds': float(self.time_elapsed),
-            'auto_mode_enabled_at_save': bool(self.auto_mode),
-            'saved_at': datetime.now().isoformat(timespec='seconds'),
-        }
-
-    def _run_has_progress(self):
-        if getattr(self, 'time_elapsed', 0.0) > 1e-9:
-            return True
-        for drone in getattr(self, 'drones', []):
-            if len(drone.get('trace_x', [])) > 1 or len(drone.get('trace_y', [])) > 1:
-                return True
-        return False
+        return None
 
     def _start_new_run(self):
-        self.run_index += 1
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.current_run_label = f'run_{self.run_index:03d}_seed_{int(self.current_seed)}_{ts}'
-        self.current_run_dir = output_root() / self.current_run_label
-        self._saved_current_run = False
         self._reset_reporting_state()
-        self._log_event('run_started', f'Started {self.current_run_label}', seed=int(self.current_seed), mission_mode=self.mission_mode, auto_policy=self.auto_policy)
+        self.session_label = f'session_seed_{int(self.current_seed)}'
+        self._log_event('session_started', 'Started session', seed=int(self.current_seed), mission_mode=self.mission_mode, auto_policy=self.auto_policy)
 
     def _finalize_current_run(self):
-        if self.current_run_dir is None or self._saved_current_run:
-            return
-        if not self._run_has_progress():
-            return
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self._record_coverage_snapshot(force=True)
-        self.last_saved_plot_path = save_trajectory_png(self.obstacles, self.drones, self.current_run_dir, ts=ts)
-        _, self.last_saved_map_path = save_map_outputs(
-            self.shared_known_grid,
-            self.drones,
-            FREE,
-            OCCUPIED,
-            self.current_run_dir,
-            ts=ts,
-            shared_landmarks=list(self.shared_known_landmarks.values()),
-        )
-        metadata = self._run_metadata()
-        write_run_metadata(self.current_run_dir, metadata)
-        metrics = self._compute_live_metrics()
-        robot_rows = []
-        all_position_errors = []
-        final_position_errors = []
-        total_distance = 0.0
-        total_idle_time = 0.0
-        total_goal_assignments = 0
-        total_goals_reached = 0
-        total_replan_attempts = 0
-        total_replan_failures = 0
-        total_stuck_events = 0
-        total_landmark_updates = 0
-        pending_manual_goals = 0
-        for drone in self.drones:
-            robot = drone['robot']
-            est_x, est_y, _ = drone['odometry'].mu
-            trace_x = list(drone.get('trace_x', []))
-            trace_y = list(drone.get('trace_y', []))
-            est_trace_x = list(drone.get('est_trace_x', []))
-            est_trace_y = list(drone.get('est_trace_y', []))
-            error_count = min(len(trace_x), len(trace_y), len(est_trace_x), len(est_trace_y))
-            position_errors = [
-                math.hypot(float(trace_x[i]) - float(est_trace_x[i]), float(trace_y[i]) - float(est_trace_y[i]))
-                for i in range(error_count)
-            ]
-            if not position_errors:
-                position_errors = [math.hypot(float(robot.x) - float(est_x), float(robot.y) - float(est_y))]
-            final_position_error = float(position_errors[-1])
-            mean_position_error = float(sum(position_errors) / len(position_errors))
-            rms_position_error = float(math.sqrt(sum(err * err for err in position_errors) / len(position_errors)))
-            max_position_error = float(max(position_errors))
-
-            replan_attempts = int(drone.get('replan_count', 0))
-            replan_failures = int(drone.get('blocked_replan_count', 0))
-            replan_successes = max(0, replan_attempts - replan_failures)
-            goal_assignments = int(drone.get('goal_assignment_count', 0))
-            goals_reached = int(drone.get('goal_reached_count', 0))
-            distance_travelled = float(drone.get('distance_travelled', 0.0))
-            idle_time = float(drone.get('idle_time', 0.0))
-            remaining_points = max(0, len(drone.get('planned_path', [])) - max(0, int(drone.get('path_progress_index', 0))))
-            manual_remaining = max(0, len(drone.get('path', [])) - int(drone.get('current_target_index', 0))) if self.mission_mode == 'manual_click' else 0
-
-            all_position_errors.extend(position_errors)
-            final_position_errors.append(final_position_error)
-            total_distance += distance_travelled
-            total_idle_time += idle_time
-            total_goal_assignments += goal_assignments
-            total_goals_reached += goals_reached
-            total_replan_attempts += replan_attempts
-            total_replan_failures += replan_failures
-            total_stuck_events += int(drone.get('stuck_events', 0))
-            total_landmark_updates += int(drone.get('measurement_update_count', 0))
-            pending_manual_goals += manual_remaining
-
-            robot_rows.append({
-                'name': drone['name'],
-                'phase': drone.get('auto_phase', 'manual'),
-                'goal_type': drone.get('last_goal_type', 'none'),
-                'goal_assignments': goal_assignments,
-                'goals_reached': goals_reached,
-                'replan_attempts': replan_attempts,
-                'replan_failures': replan_failures,
-                'replan_successes': replan_successes,
-                'replan_failure_rate': round(replan_failures / replan_attempts, 6) if replan_attempts else 0.0,
-                'stuck_events': int(drone.get('stuck_events', 0)),
-                'measurement_updates': int(drone.get('measurement_update_count', 0)),
-                'landmarks_discovered': int(len(drone.get('known_landmarks', {}))),
-                'currently_visible_landmarks': int(len(drone.get('last_detected_landmarks', []))),
-                'last_landmark_update_time': '' if drone.get('last_landmark_update_time') is None else round(float(drone.get('last_landmark_update_time')), 3),
-                'distance_travelled_m': round(distance_travelled, 3),
-                'idle_time_s': round(idle_time, 3),
-                'idle_fraction': round(idle_time / float(self.time_elapsed), 6) if self.time_elapsed > 1e-9 else 0.0,
-                'visited_cell_count': int(len(drone.get('visited_cells', []))),
-                'path_waypoint_count': int(len(drone.get('manual_path', []))),
-                'remaining_path_points': remaining_points,
-                'remaining_path_length_m': round(self._remaining_path_length(drone), 3),
-                'mean_position_error_m': round(mean_position_error, 3),
-                'rms_position_error_m': round(rms_position_error, 3),
-                'max_position_error_m': round(max_position_error, 3),
-                'final_position_error_m': round(final_position_error, 3),
-                'final_true_x': round(float(robot.x), 3),
-                'final_true_y': round(float(robot.y), 3),
-                'final_est_x': round(float(est_x), 3),
-                'final_est_y': round(float(est_y), 3),
-            })
-
-        mean_position_error = float(sum(all_position_errors) / len(all_position_errors)) if all_position_errors else 0.0
-        rms_position_error = float(math.sqrt(sum(err * err for err in all_position_errors) / len(all_position_errors))) if all_position_errors else 0.0
-        max_position_error = float(max(all_position_errors)) if all_position_errors else 0.0
-        mean_final_position_error = float(sum(final_position_errors) / len(final_position_errors)) if final_position_errors else 0.0
-        max_final_position_error = float(max(final_position_errors)) if final_position_errors else 0.0
-        team_idle_fraction = (total_idle_time / (float(self.time_elapsed) * max(1, len(self.drones)))) if self.time_elapsed > 1e-9 else 0.0
-        goal_reassignments = max(0, total_goal_assignments - total_goals_reached)
-        total_landmarks = int(len(self.landmarks))
-        shared_landmarks_discovered = int(len(self.shared_known_landmarks))
-        landmark_rows = self._landmark_rows()
-        summary = {
-            'known_ratio': round(float(metrics['known_ratio']), 6),
-            'free_coverage_ratio': round(float(metrics['free_coverage_ratio']), 6),
-            'occupied_recall_ratio': round(float(metrics['occupied_recall_ratio']), 6),
-            'frontier_count': int(metrics['frontier_count']),
-            'active_goals': int(metrics['active_goals']),
-            'pending_manual_goals': int(pending_manual_goals),
-            'total_distance_m': round(total_distance, 3),
-            'total_idle_time_s': round(total_idle_time, 3),
-            'team_idle_fraction': round(team_idle_fraction, 6),
-            'coverage_rate_pct_per_s': round((100.0 * float(metrics['free_coverage_ratio']) / float(self.time_elapsed)) if self.time_elapsed > 1e-9 else 0.0, 6),
-            'coverage_per_meter_pct_per_m': round((100.0 * float(metrics['free_coverage_ratio']) / total_distance) if total_distance > 1e-9 else 0.0, 6),
-            'obstacle_recall_rate_pct_per_s': round((100.0 * float(metrics['occupied_recall_ratio']) / float(self.time_elapsed)) if self.time_elapsed > 1e-9 else 0.0, 6),
-            'total_goal_assignments': int(total_goal_assignments),
-            'total_goals_reached': int(total_goals_reached),
-            'goal_reassignments': int(goal_reassignments),
-            'goal_completion_rate': round((total_goals_reached / total_goal_assignments) if total_goal_assignments else 0.0, 6),
-            'total_replan_attempts': int(total_replan_attempts),
-            'total_replan_failures': int(total_replan_failures),
-            'replan_failure_rate': round((total_replan_failures / total_replan_attempts) if total_replan_attempts else 0.0, 6),
-            'total_stuck_events': int(total_stuck_events),
-            'total_landmark_updates': int(total_landmark_updates),
-            'total_landmarks': int(total_landmarks),
-            'shared_landmarks_discovered': int(shared_landmarks_discovered),
-            'landmark_discovery_ratio': round((shared_landmarks_discovered / total_landmarks) if total_landmarks else 0.0, 6),
-            'mean_position_error_m': round(mean_position_error, 6),
-            'rms_position_error_m': round(rms_position_error, 6),
-            'max_position_error_m': round(max_position_error, 6),
-            'mean_final_position_error_m': round(mean_final_position_error, 6),
-            'max_final_position_error_m': round(max_final_position_error, 6),
-            'event_count': int(len(self.event_log)),
-            'coverage_samples': int(len(self.coverage_history)),
-            'auto_finished': bool(self.auto_finished),
-            'last_saved_plot_path': self.last_saved_plot_path,
-            'last_saved_map_path': self.last_saved_map_path,
-        }
-        self._log_event('run_saved', f"Saved outputs to {self.current_run_dir}", output_dir=str(self.current_run_dir), known_ratio=summary['known_ratio'], free_coverage_ratio=summary['free_coverage_ratio'])
-        save_run_reports(
-            out_dir=self.current_run_dir,
-            metadata=metadata,
-            coverage_history=self.coverage_history,
-            event_log=self.event_log,
-            robot_rows=robot_rows,
-            landmark_rows=landmark_rows,
-            summary=summary,
-            ts=ts,
-        )
-        self._saved_current_run = True
-
-    def _save_trajectory_png(self, ts=None):
-        out_dir = self.current_run_dir or run_output_dir('run_manual')
-        self.last_saved_plot_path = save_trajectory_png(
-            self.obstacles,
-            self.drones,
-            out_dir,
-            ts=ts,
-        )
-        return self.last_saved_plot_path
-
-    def _save_map_outputs(self, ts=None):
-        out_dir = self.current_run_dir or run_output_dir('run_manual')
-        _, maps_path = save_map_outputs(
-            self.shared_known_grid,
-            self.drones,
-            FREE,
-            OCCUPIED,
-            out_dir,
-            ts=ts,
-            shared_landmarks=list(self.shared_known_landmarks.values()),
-        )
-        self.last_saved_map_path = maps_path
-        return maps_path
+        return None
 
     def _prepare_for_new_run(self):
-        self._finalize_current_run()
-        self._start_new_run()
+        self._reset_reporting_state()
+        self.session_label = f'session_seed_{int(self.current_seed)}'
+        self._log_event('session_reset', 'Reset simulation state', seed=int(self.current_seed))
 
     def _seed_for_drone(self, drone_index, stream=0):
         return int(self.current_seed * 1000 + 97 * (drone_index + 1) + stream)
 
     def _start_pose_for_index(self, drone_index, drone_count):
-        base_x, base_y, base_angle = DRONE_START_POSE
+        base = self.home_base
+        cx = float(base["cx"])
+        cy = float(base["cy"])
+        base_angle = float(base["heading_deg"])
+        # Spawn robots in stable slots across the home-base width instead of a tight arc.
+        # This reduces startup symmetry and gives each robot a clear initial lane out of home.
+        usable_half_w = max(0.3, float(HOME_BASE_WIDTH) / 2.0 - float(HOME_BASE_SPAWN_SLOT_MARGIN_X) - float(ROBOT_RADIUS))
+        front_y = cy + max(0.0, float(HOME_BASE_HEIGHT) / 2.0 - float(HOME_BASE_SPAWN_FRONT_OFFSET) - float(ROBOT_RADIUS))
         if drone_count <= 1:
-            return base_x, base_y, base_angle
+            x = cx
+            y = front_y
+            return float(x), float(y), base_angle
 
-        offset_index = drone_index - 0.5 * (drone_count - 1)
-        offset = offset_index * DRONE_START_SPACING
-        angle_rad = math.radians(base_angle)
-        perp_x = -math.sin(angle_rad)
-        perp_y = math.cos(angle_rad)
-        x = float(np.clip(base_x + offset * perp_x, 1.0, WORLD_WIDTH_METERS - 1.0))
-        y = float(np.clip(base_y + offset * perp_y, 1.0, WORLD_HEIGHT_METERS - 1.0))
-        return x, y, base_angle
+        xs = np.linspace(cx - usable_half_w, cx + usable_half_w, int(drone_count))
+        x = float(xs[int(np.clip(drone_index, 0, drone_count - 1))])
+        y = float(front_y)
+        frac = drone_index / max(1, drone_count - 1)
+        # Fan headings outward from the base center so left slots head left/outward
+        # and right slots head right/outward instead of crossing through the base.
+        heading_deg = base_angle + 0.5 * float(HOME_BASE_SPAWN_HEADING_FAN_DEGREES) - float(HOME_BASE_SPAWN_HEADING_FAN_DEGREES) * frac
+        # Keep the spawn strictly inside the home base footprint.
+        half_w = float(HOME_BASE_WIDTH) / 2.0 - float(ROBOT_RADIUS) - 0.05
+        half_h = float(HOME_BASE_HEIGHT) / 2.0 - float(ROBOT_RADIUS) - 0.05
+        x = float(np.clip(x, cx - half_w, cx + half_w))
+        y = float(np.clip(y, cy - half_h, cy + half_h))
+        x = float(np.clip(x, 1.0, WORLD_WIDTH_METERS - 1.0))
+        y = float(np.clip(y, 1.0, WORLD_HEIGHT_METERS - 1.0))
+        return x, y, heading_deg
 
     def _load_environment(self, seed):
         self.current_seed = int(seed)
+        self.home_base = home_base_region()
         obstacles, landmark_dicts = generate_environment(self.current_seed)
         self.obstacles = list(obstacles)
         self.landmarks = [Landmark(**lm) for lm in landmark_dicts]
+        self.landmarks.append(self._home_marker())
         self.shared_known_landmarks = {}
         self.generated_target_sequences = empty_target_sequences()
         self.truth_occupancy = self._build_truth_occupancy_grid()
@@ -970,6 +885,25 @@ class Simulator:
             except ValueError:
                 pass
         self.landmark_patches = []
+        if self.home_base_patch is not None:
+            try:
+                self.home_base_patch.remove()
+            except ValueError:
+                pass
+            self.home_base_patch = None
+
+        base = self.home_base
+        self.home_base_patch = patches.Rectangle(
+            (base["cx"] - base["width"] / 2.0, base["cy"] - base["height"] / 2.0),
+            base["width"],
+            base["height"],
+            facecolor=(0.18, 0.60, 0.32, float(HOME_BASE_DRAW_ALPHA)),
+            edgecolor=(0.12, 0.45, 0.22, 0.95),
+            linewidth=1.4,
+            linestyle='--',
+            zorder=1.8,
+        )
+        self.ax.add_patch(self.home_base_patch)
 
         for obs in self.obstacles:
             half = obs['size'] / 2.0
@@ -978,9 +912,9 @@ class Simulator:
                 obs['size'],
                 obs['size'],
                 facecolor=COLOR_OBSTACLE,
-                edgecolor='black',
-                linewidth=1.7,
-                alpha=0.88,
+                edgecolor=COLOR_OBSTACLE,
+                linewidth=0.6,
+                alpha=0.92,
                 zorder=3,
             )
             self.ax.add_patch(patch)
@@ -997,17 +931,407 @@ class Simulator:
     def _init_known_grid(self):
         return self.planner.init_known_grid(OCCUPIED)
 
+    def _init_belief_layers(self, known_grid=None):
+        base_grid = self._init_known_grid() if known_grid is None else known_grid
+        return initialize_belief_grids(base_grid, OCCUPIED)
+
+    def _init_pose_uncertainty_grid(self, known_grid=None):
+        base_grid = self._init_known_grid() if known_grid is None else known_grid
+        return initialize_pose_uncertainty_grid(base_grid, OCCUPIED)
+
+    def _reveal_start_area_with_belief(self, grid, logodds_grid, confidence_grid, pose_uncertainty_grid, x, y, radius_m=1.1):
+        reveal_start_area_with_belief(
+            grid,
+            logodds_grid,
+            confidence_grid,
+            pose_uncertainty_grid,
+            x,
+            y,
+            radius_m,
+            self._world_to_grid,
+            self._offsets_for_margin,
+            self.nx,
+            self.ny,
+            UNKNOWN,
+            FREE,
+        )
+
     def _offsets_for_margin(self, margin_m):
         return self.planner.offsets_for_margin(margin_m)
 
     def _stamp_obstacle_hit(self, known_grid, gx, gy):
-        self.planner.stamp_obstacle_hit(known_grid, gx, gy, OCCUPIED)
+        return self.planner.stamp_obstacle_hit(known_grid, gx, gy, OCCUPIED)
 
-    def _planning_occupancy(self, known_grid):
-        return self.planner.planning_occupancy(known_grid, OCCUPIED)
+
+    def _invalidate_planning_cache(self):
+        self._planning_occupancy_version = int(getattr(self, '_planning_occupancy_version', 0)) + 1
+        cache = getattr(self, '_planning_occ_cache_frame', None)
+        if isinstance(cache, dict):
+            cache.clear()
+
+    def _planning_occupancy(self, known_grid, exclude_drone=None):
+        exclude_idx = -1 if exclude_drone is None else int(exclude_drone.get('drone_index', -1))
+        pos_signature = tuple(self._estimated_grid_cell(dr) for dr in getattr(self, 'drones', []))
+        cache_key = (int(getattr(self, '_planning_occupancy_version', 0)), exclude_idx, pos_signature)
+        cache = getattr(self, '_planning_occ_cache_frame', None)
+        if isinstance(cache, dict) and cache_key in cache:
+            return cache[cache_key]
+
+        occ = np.array(self.planner.planning_occupancy(known_grid, OCCUPIED), copy=True)
+        for other in getattr(self, 'drones', []):
+            if exclude_drone is not None and other is exclude_drone:
+                continue
+            ox, oy = self._estimated_xy(other)
+            radius_m = float(getattr(other['robot'], 'size', 0.0)) / 2.0
+            for dx, dy in self._offsets_for_margin(radius_m):
+                gx, gy = self._world_to_grid(ox + dx * self.grid_resolution, oy + dy * self.grid_resolution)
+                if 0 <= gx < self.nx and 0 <= gy < self.ny:
+                    occ[gy, gx] = True
+        if isinstance(cache, dict):
+            cache[cache_key] = occ
+        return occ
 
     def _world_to_grid(self, x, y):
         return self.planner.world_to_grid(x, y)
+
+    @staticmethod
+    def _estimated_xy(drone):
+        x_est, y_est, _ = drone['odometry'].mu
+        return float(x_est), float(y_est)
+
+    def _estimated_grid_cell(self, drone):
+        x_est, y_est = self._estimated_xy(drone)
+        return self._world_to_grid(x_est, y_est)
+
+    def _recent_estimated_path(self, drone, max_points=PATH_HISTORY_PACKET_POINTS):
+        xs = list(drone.get('est_trace_x', []))
+        ys = list(drone.get('est_trace_y', []))
+        pts = list(zip(xs, ys))
+        if not pts:
+            return []
+        if len(pts) > max_points:
+            step = max(1, len(pts) // max_points)
+            pts = pts[::step]
+            if pts[-1] != (xs[-1], ys[-1]):
+                pts.append((xs[-1], ys[-1]))
+        return [(float(x), float(y)) for x, y in pts[-max_points:]]
+
+    def _packet_from_drone(self, drone):
+        pose = tuple(float(v) for v in drone['odometry'].mu)
+        pose_cov = np.asarray(drone['odometry'].cov, dtype=float)
+        pose_trace = float(np.trace(pose_cov[:2, :2]))
+        role = str(drone.get('team_role') or drone.get('auto_phase') or ('explorer' if self.mission_mode == 'auto_explore' else 'manual'))
+        past_waypoints = self._recent_estimated_path(drone)
+        return {
+            'name': str(drone.get('name', '')),
+            'timestamp': float(self.time_elapsed),
+            'pose': pose,
+            'pose_cov': pose_cov.tolist(),
+            'pose_trace': pose_trace,
+            'goal': tuple(drone['auto_goal_xy']) if drone.get('auto_goal_xy') is not None else None,
+            'role': role,
+            'path_history': past_waypoints,
+            'past_waypoints': past_waypoints,
+        }
+
+    def _exchange_packet(self, receiver, sender):
+        receiver.setdefault('teammate_memory', {})[sender['name']] = self._packet_from_drone(sender)
+
+    def _packet_reliability(self, packet):
+        age = max(0.0, float(self.time_elapsed) - float(packet.get('timestamp', -1e9)))
+        stale_weight = math.exp(-float(TEAMMATE_STALE_DECAY) * age)
+        pose_trace = max(0.0, float(packet.get('pose_trace', 0.0)))
+        trace_scale = max(1e-6, float(TEAMMATE_TRACE_SCALE))
+        trace_weight = 1.0 / (1.0 + pose_trace / trace_scale)
+        return max(float(TEAMMATE_MIN_RELIABILITY), min(1.0, stale_weight * trace_weight))
+
+    def _valid_teammate_packets(self, drone):
+        packets = []
+        stale_limit = float(TEAMMATE_PACKET_STALE_SECONDS)
+        for packet in drone.get('teammate_memory', {}).values():
+            if not isinstance(packet, dict):
+                continue
+            age = float(self.time_elapsed) - float(packet.get('timestamp', -1e9))
+            if age > stale_limit:
+                continue
+            pkt = dict(packet)
+            pkt['age'] = age
+            pkt['reliability'] = self._packet_reliability(pkt)
+            packets.append(pkt)
+        return packets
+
+    @staticmethod
+    def _sanitize_xy_cov(cov_xy, fallback_trace=1e-3):
+        cov_xy = np.asarray(cov_xy, dtype=float)
+        if cov_xy.shape != (2, 2):
+            fallback_trace = max(float(fallback_trace), 1e-6)
+            cov_xy = np.eye(2, dtype=float) * (0.5 * fallback_trace)
+        cov_xy = 0.5 * (cov_xy + cov_xy.T)
+        eigvals, eigvecs = np.linalg.eigh(cov_xy)
+        eigvals = np.maximum(eigvals, 1e-9)
+        return eigvecs @ np.diag(eigvals) @ eigvecs.T
+
+    def _packet_xy_cov(self, packet):
+        pose_cov = np.asarray(packet.get('pose_cov', []), dtype=float)
+        pose_trace = max(0.0, float(packet.get('pose_trace', 0.0)))
+        if pose_cov.shape == (3, 3):
+            xy_cov = pose_cov[:2, :2]
+        elif pose_cov.shape == (2, 2):
+            xy_cov = pose_cov
+        else:
+            xy_cov = np.eye(2, dtype=float) * max(1e-6, 0.5 * pose_trace)
+        xy_cov = self._sanitize_xy_cov(xy_cov, fallback_trace=pose_trace)
+
+        age = max(0.0, float(packet.get('age', 0.0)))
+        drift_std = max(float(PREDICTION_NOISE[0]), float(PREDICTION_NOISE[1])) * age
+        drift_cov = np.eye(2, dtype=float) * (drift_std ** 2)
+        reference_floor_cov = np.eye(2, dtype=float) * (0.5 * float(INTERROBOT_NOISE_FROM_REFERENCE_TRACE_GAIN) * pose_trace)
+        return self._sanitize_xy_cov(xy_cov + drift_cov + reference_floor_cov, fallback_trace=pose_trace)
+
+    def _home_base_measurement(self, drone):
+        robot = drone['robot']
+        base_x = float(self.home_base['cx'])
+        base_y = float(self.home_base['cy'])
+        dx = base_x - float(robot.x)
+        dy = base_y - float(robot.y)
+        distance = math.hypot(dx, dy)
+        if distance > float(self.view_distance):
+            return None
+        target_angle = np.degrees(np.arctan2(dy, dx)) % 360.0
+        if not robot._angle_in_fov(target_angle, float(robot.angle) % 360.0, float(self.fov_angle)):
+            return None
+        if robot.line_of_sight_blocked(base_x, base_y, self.obstacles):
+            return None
+
+        range_noise = float(MEASUREMENT_NOISE[0])
+        bearing_noise = float(MEASUREMENT_NOISE[1])
+        r = distance + drone['rng'].normal(0.0, range_noise)
+        true_bearing = (np.degrees(np.arctan2(dy, dx)) - float(robot.angle)) % 360.0
+        if true_bearing > 180.0:
+            true_bearing -= 360.0
+        b = true_bearing + drone['rng'].normal(0.0, bearing_noise)
+        return (r, b, base_x, base_y)
+
+    def _home_marker(self):
+        return Landmark(
+            x=float(self.home_base['cx']),
+            y=float(self.home_base['cy']),
+            shape=str(HOME_BASE_MARKER_SHAPE),
+            color=str(HOME_BASE_MARKER_COLOR),
+            size=float(HOME_BASE_MARKER_SIZE),
+        )
+
+    def _home_return_goal_for_drone(self, drone):
+        idx = int(drone.get('drone_index', 0))
+        x, y, _heading = self._start_pose_for_index(idx, max(1, len(self.drones)))
+        return float(x), float(y)
+
+    def _drone_home_pose_error(self, drone):
+        gx, gy = self._home_return_goal_for_drone(drone)
+        x_est, y_est, _ = drone['odometry'].mu
+        return math.hypot(float(gx) - float(x_est), float(gy) - float(y_est))
+
+    def _drone_is_home(self, drone):
+        robot = drone['robot']
+        base_half_w = 0.5 * float(self.home_base['width']) - 0.2 * float(robot.size)
+        base_half_h = 0.5 * float(self.home_base['height']) - 0.2 * float(robot.size)
+        in_box = (
+            abs(float(robot.x) - float(self.home_base['cx'])) <= max(0.0, base_half_w)
+            and abs(float(robot.y) - float(self.home_base['cy'])) <= max(0.0, base_half_h)
+        )
+        return in_box and self._drone_home_pose_error(drone) <= max(float(RETURN_HOME_GOAL_TOLERANCE), 0.55)
+
+    def _begin_return_phase(self):
+        if self.return_phase_active:
+            return
+        self.return_phase_active = True
+        self.return_finish_candidate_time = None
+        self.auto_finish_candidate_time = None
+        for drone in self.drones:
+            drone['auto_phase'] = 'return'
+            drone['auto_goal_xy'] = None
+            drone['auto_goal_last_set_time'] = -1e9
+            drone['auto_goal_meta'] = {'goal_flavor': 'return-home'}
+            drone['path'] = []
+            drone['current_target_index'] = 0
+            drone['planned_path'] = []
+            drone['plan_goal_index'] = -1
+            drone['last_plan_time'] = -1e9
+            drone['path_progress_index'] = 0
+            drone['team_role'] = 'return'
+            drone['target_marker'].set_data([], [])
+            drone['subgoal_marker'].set_data([], [])
+            drone['plan_line'].set_data([], [])
+            self._update_mission_artist(drone)
+        self._log_event('return_phase_started', 'Exploration complete; robots returning to home base')
+
+    def _all_robots_home_and_idle(self):
+        for drone in self.drones:
+            if drone.get('auto_phase') not in ('return', 'returned'):
+                return False
+            if not self._drone_is_home(drone):
+                return False
+            if drone.get('auto_goal_xy') is not None:
+                return False
+            if drone.get('path') or drone.get('planned_path'):
+                return False
+            if drone.get('last_command_active', False):
+                return False
+        return True
+
+    def _interrobot_measurements(self, drone):
+        if not bool(INTERROBOT_USE_AS_LANDMARK):
+            return []
+        robot = drone['robot']
+        measurements = []
+        visible_names = set(drone.get('visible_teammates', []))
+        for packet in self._valid_teammate_packets(drone):
+            name = str(packet.get('name', ''))
+            if name not in visible_names:
+                continue
+            ref_trace = float(packet.get('pose_trace', 1e9))
+            if ref_trace > float(INTERROBOT_MAX_REFERENCE_TRACE):
+                continue
+            ref_pose = packet.get('pose', None)
+            if ref_pose is None or len(ref_pose) < 2:
+                continue
+            other = next((d for d in self.drones if d.get('name') == name), None)
+            if other is None:
+                continue
+
+            dx = float(other['robot'].x) - float(robot.x)
+            dy = float(other['robot'].y) - float(robot.y)
+            r = np.hypot(dx, dy) + drone['rng'].normal(0.0, float(INTERROBOT_MEASUREMENT_NOISE[0]))
+            true_bearing = (np.degrees(np.arctan2(dy, dx)) - float(robot.angle)) % 360.0
+            if true_bearing > 180.0:
+                true_bearing -= 360.0
+            b = true_bearing + drone['rng'].normal(0.0, float(INTERROBOT_MEASUREMENT_NOISE[1]))
+
+            ref_x = float(ref_pose[0])
+            ref_y = float(ref_pose[1])
+            ref_cov_xy = self._packet_xy_cov(packet)
+            reliability = float(packet.get('reliability', 1.0))
+            sensor_R = np.diag([
+                float(INTERROBOT_MEASUREMENT_NOISE[0]) ** 2,
+                float(INTERROBOT_MEASUREMENT_NOISE[1]) ** 2,
+            ])
+            measurements.append(((r, b, ref_x, ref_y, ref_cov_xy), sensor_R, reliability, name))
+        return measurements
+
+    def _update_los_and_packets(self):
+        self.shared_los_segments = []
+        for drone in getattr(self, 'drones', []):
+            drone['visible_teammates'] = []
+            drone['visible_segments_est'] = []
+        for i, a in enumerate(getattr(self, 'drones', [])):
+            for b in self.drones[i + 1:]:
+                ra = a['robot']
+                rb = b['robot']
+                if math.hypot(float(ra.x) - float(rb.x), float(ra.y) - float(rb.y)) > float(COMMUNICATION_RADIUS):
+                    continue
+                if ra.line_of_sight_blocked(rb.x, rb.y, self.obstacles):
+                    continue
+                ax, ay = self._estimated_xy(a)
+                bx, by = self._estimated_xy(b)
+                seg = [(ax, ay), (bx, by)]
+                self.shared_los_segments.append(seg)
+                a['visible_teammates'].append(b['name'])
+                b['visible_teammates'].append(a['name'])
+                a['visible_segments_est'].append(seg)
+                b['visible_segments_est'].append(seg)
+                self._exchange_packet(a, b)
+                self._exchange_packet(b, a)
+
+    @staticmethod
+    def _wrap_angle_deg(angle_deg):
+        angle = float(angle_deg)
+        while angle > 180.0:
+            angle -= 360.0
+        while angle <= -180.0:
+            angle += 360.0
+        return angle
+
+    def _record_recent_scan(self, drone, robot, scan):
+        drone.setdefault('recent_scan_buffer', deque(maxlen=MAP_SCAN_BUFFER_SIZE)).append(
+            scan_buffer_entry_from_scan(robot, scan, drone['odometry'].mu, drone['odometry'].cov, self.time_elapsed)
+        )
+
+    def _should_replay_recent_scans(self, pre_mu, pre_cov, post_mu, post_cov):
+        pre_trace = float(np.trace(pre_cov[:2, :2]))
+        post_trace = float(np.trace(post_cov[:2, :2]))
+        trace_gain = pre_trace - post_trace
+        pos_shift = math.hypot(float(post_mu[0]) - float(pre_mu[0]), float(post_mu[1]) - float(pre_mu[1]))
+        heading_shift = abs(self._wrap_angle_deg(float(post_mu[2]) - float(pre_mu[2])))
+        return bool(
+            trace_gain >= MAP_REPLAY_MIN_TRACE_IMPROVEMENT
+            or pos_shift >= MAP_REPLAY_MIN_POSITION_SHIFT
+            or heading_shift >= MAP_REPLAY_MIN_HEADING_SHIFT_DEG
+        )
+
+    def _replay_recent_scans(self, drone, delta_pose):
+        buffer = list(drone.get('recent_scan_buffer', []))
+        if not buffer:
+            return
+        replay_limit = max(1, int(MAP_REPLAY_MAX_SCANS))
+        if len(buffer) > replay_limit:
+            buffer = buffer[-replay_limit:]
+        drone['recent_scan_buffer'] = deque(
+            (shifted_scan_buffer_entry(entry, delta_pose) for entry in buffer),
+            maxlen=MAP_SCAN_BUFFER_SIZE,
+        )
+        start_x, start_y, _ = self._start_pose_for_index(drone.get('drone_index', 0), len(self.drones))
+        drone['local_known_grid'] = self._init_known_grid()
+        drone['local_logodds_grid'], drone['local_confidence_grid'] = self._init_belief_layers(drone['local_known_grid'])
+        drone['local_pose_uncertainty_grid'] = self._init_pose_uncertainty_grid(drone['local_known_grid'])
+        self._mark_local_uncertainty_dirty(drone)
+        self._reveal_start_area_with_belief(
+            drone['local_known_grid'],
+            drone['local_logodds_grid'],
+            drone['local_confidence_grid'],
+            drone['local_pose_uncertainty_grid'],
+            start_x,
+            start_y,
+        )
+        for entry in drone['recent_scan_buffer']:
+            pose_x, pose_y, pose_theta = (float(v) for v in entry['pose'])
+            pose_proxy = type('PoseProxy', (), {'x': pose_x, 'y': pose_y, 'angle': pose_theta})()
+            pose_cov = np.diag([max(0.02, float(entry.get('pose_trace', 0.0)) / 2.0)] * 2 + [1.0])
+            replay_scan = scan_from_buffer_entry(entry)
+            self._apply_scan_to_grid(
+                drone['local_known_grid'],
+                drone['local_logodds_grid'],
+                drone['local_confidence_grid'],
+                drone['local_pose_uncertainty_grid'],
+                pose_proxy,
+                replay_scan,
+                pose_cov,
+            )
+        drone['local_known_occ_count'] = int(np.count_nonzero(drone['local_known_grid'] == OCCUPIED))
+        self._merge_local_into_shared_if_better(drone)
+        self._update_local_grid_visual(drone)
+
+    def _merge_local_into_shared_if_better(self, drone):
+        local_unc = drone['local_pose_uncertainty_grid']
+        shared_unc = self.shared_pose_uncertainty_grid
+        local_conf = drone['local_confidence_grid']
+        shared_conf = self.shared_confidence_grid
+        local_finite = np.isfinite(local_unc)
+        shared_finite = np.isfinite(shared_unc)
+        lower_unc = local_finite & (~shared_finite | (local_unc + 1e-6 < shared_unc))
+        same_unc = np.zeros_like(local_finite, dtype=bool)
+        finite_both = local_finite & shared_finite
+        same_unc[finite_both] = np.abs(local_unc[finite_both] - shared_unc[finite_both]) <= 1e-6
+        tie_break_conf = same_unc & (local_conf > shared_conf)
+        better_mask = lower_unc | tie_break_conf
+        if not np.any(better_mask):
+            return
+        self.shared_logodds_grid[better_mask] = drone['local_logodds_grid'][better_mask]
+        self.shared_confidence_grid[better_mask] = local_conf[better_mask]
+        self.shared_pose_uncertainty_grid[better_mask] = local_unc[better_mask]
+        self.shared_known_grid[better_mask] = drone['local_known_grid'][better_mask]
+        self._invalidate_planning_cache()
+        self._mark_partition_dirty()
+        self._mark_shared_uncertainty_dirty()
 
     def _grid_to_world(self, cell):
         return self.planner.grid_to_world(cell)
@@ -1059,6 +1383,39 @@ class Simulator:
         self._last_partition_generators = generators.copy()
         self._partition_dirty = False
 
+    def _belief_uncertainty_rgba(self, logodds_grid, pose_uncertainty_grid, known_grid):
+        known = np.asarray(known_grid) != UNKNOWN
+        pose_unc = np.asarray(pose_uncertainty_grid, dtype=float)
+        finite_vals = pose_unc[np.isfinite(pose_unc) & known]
+        if finite_vals.size:
+            robust_scale = max(1e-6, float(np.percentile(finite_vals, 90)))
+        else:
+            robust_scale = max(1e-6, float(MAP_UNCERTAINTY_VIS_METERS_SCALE))
+        robust_scale = max(robust_scale, float(MAP_UNCERTAINTY_VIS_METERS_SCALE))
+        pose_term = np.clip(np.where(np.isfinite(pose_unc), pose_unc / robust_scale, 0.0), 0.0, 1.0)
+        logodds = np.clip(np.asarray(logodds_grid, dtype=float), -60.0, 60.0)
+        probs = 1.0 / (1.0 + np.exp(-logodds))
+        probs = np.clip(probs, 1e-6, 1.0 - 1e-6)
+        entropy = -(probs * np.log(probs) + (1.0 - probs) * np.log(1.0 - probs)) / math.log(2.0)
+        combined = np.clip(0.82 * pose_term + 0.18 * entropy, 0.0, 1.0)
+        rgba = plt.cm.turbo(combined)
+        rgba = np.asarray(rgba, dtype=float)
+        rgba[..., 3] = (0.18 + 0.58 * combined) * known.astype(float)
+        rgba[~known, 3] = 0.0
+        return rgba
+
+    def _shared_uncertainty_rgba(self, force=False):
+        if force or self._shared_uncertainty_dirty:
+            self.uncertainty_rgba = self._belief_uncertainty_rgba(self.shared_logodds_grid, self.shared_pose_uncertainty_grid, self.shared_known_grid)
+            self._shared_uncertainty_dirty = False
+        return self.uncertainty_rgba
+
+    def _local_uncertainty_rgba(self, drone, force=False):
+        if force or drone.get('local_uncertainty_dirty', True):
+            drone['local_uncertainty_rgba_cache'] = self._belief_uncertainty_rgba(drone['local_logodds_grid'], drone['local_pose_uncertainty_grid'], drone['local_known_grid'])
+            drone['local_uncertainty_dirty'] = False
+        return drone['local_uncertainty_rgba_cache']
+
     def _assign_auto_goal(self, drone, goal_xy, meta=None):
         x_est, y_est, _ = drone['odometry'].mu
         prev_goal = drone.get('auto_goal_xy')
@@ -1095,20 +1452,73 @@ class Simulator:
                 self._log_event('goal_cleared', 'No valid exploration goal available', drone=drone)
         self._update_mission_artist(drone)
 
+
+    def _estimated_team_centroid(self):
+        pts = []
+        for drone in self.drones:
+            try:
+                x_est, y_est, _ = drone['odometry'].mu
+                pts.append((float(x_est), float(y_est)))
+            except Exception:
+                continue
+        if not pts:
+            starts = [self._start_pose_for_index(i, len(self.drones))[:2] for i in range(len(self.drones))]
+            pts = [(float(x), float(y)) for x, y in starts]
+        arr = np.asarray(pts, dtype=float)
+        return np.mean(arr, axis=0)
+
+    def _mean_pairwise_estimated_distance(self):
+        pts = []
+        for drone in self.drones:
+            try:
+                x_est, y_est, _ = drone['odometry'].mu
+                pts.append((float(x_est), float(y_est)))
+            except Exception:
+                continue
+        if len(pts) < 2:
+            return 0.0
+        total = 0.0
+        count = 0
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                total += math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
+                count += 1
+        return total / max(1, count)
+
+    def _startup_dispersion_active(self):
+        if not AUTO_LAUNCH_DISPERSAL_ENABLED:
+            return False
+        if self.time_elapsed >= float(AUTO_LAUNCH_DISPERSAL_MAX_SECONDS):
+            return False
+        return self._mean_pairwise_estimated_distance() < float(AUTO_STARTUP_DISPERSION_MEAN_PAIRWISE_DISTANCE)
+
+    def _partition_penalty_scale(self):
+        return float(AUTO_STARTUP_PARTITION_PENALTY_SCALE) if self._startup_dispersion_active() else 1.0
+
     def _launch_phase_expired(self, drone):
-        return self.time_elapsed >= float(AUTO_LAUNCH_DISPERSAL_MAX_SECONDS)
+        return (self.time_elapsed >= float(AUTO_LAUNCH_DISPERSAL_MAX_SECONDS)) or (not self._startup_dispersion_active())
 
     def _teammate_context(self, drone):
         teammate_positions = []
         teammate_goal_positions = []
-        for other in self.drones:
-            if other is drone:
-                continue
-            ox, oy, _ = other['odometry'].mu
-            teammate_positions.append((ox, oy))
-            if other.get('auto_goal_xy') is not None and other.get('auto_phase', 'explore') == 'explore':
-                teammate_goal_positions.append(tuple(other['auto_goal_xy']))
-        return teammate_positions, teammate_goal_positions
+        teammate_path_histories = []
+        for packet in self._valid_teammate_packets(drone):
+            reliability = float(packet.get('reliability', 1.0))
+            pose = packet.get('pose', None)
+            if pose is not None and len(pose) >= 2:
+                teammate_positions.append((float(pose[0]), float(pose[1]), reliability))
+            goal = packet.get('goal', None)
+            role = str(packet.get('role', 'explorer')).lower()
+            if goal is not None and role in {'explorer', 'explore', 'launch'}:
+                teammate_goal_positions.append((float(goal[0]), float(goal[1]), reliability))
+            hist = packet.get('past_waypoints') or packet.get('path_history')
+            if hist:
+                teammate_path_histories.append({
+                    'points': [(float(px), float(py)) for px, py in hist],
+                    'weight': reliability,
+                    'timestamp': float(packet.get('timestamp', self.time_elapsed)),
+                })
+        return teammate_positions, teammate_goal_positions, teammate_path_histories
 
     def _auto_centroid_for_drone(self, drone):
         idx = int(drone.get('drone_index', 0))
@@ -1123,7 +1533,12 @@ class Simulator:
         if goal_xy is None:
             return False
         x_est, y_est, _ = drone['odometry'].mu
-        goal_tol = AUTO_LAUNCH_DISPERSAL_GOAL_TOLERANCE if (self.mission_mode == 'auto_explore' and drone.get('auto_phase', 'explore') == 'launch') else A_STAR_GOAL_TOLERANCE
+        if self.mission_mode == 'auto_explore' and drone.get('auto_phase', 'explore') == 'launch':
+            goal_tol = AUTO_LAUNCH_DISPERSAL_GOAL_TOLERANCE
+        elif self.mission_mode == 'auto_explore' and drone.get('auto_phase', 'explore') == 'return':
+            goal_tol = RETURN_HOME_GOAL_TOLERANCE
+        else:
+            goal_tol = A_STAR_GOAL_TOLERANCE
         return math.hypot(float(goal_xy[0]) - x_est, float(goal_xy[1]) - y_est) > 1.05 * goal_tol
 
     def _should_keep_current_auto_goal(self, drone, candidate_goal_xy, candidate_meta):
@@ -1151,7 +1566,7 @@ class Simulator:
 
     def _choose_auto_goal(self, drone):
         x_est, y_est, _ = drone['odometry'].mu
-        teammate_positions, teammate_goal_positions = self._teammate_context(drone)
+        teammate_positions, teammate_goal_positions, teammate_path_histories = self._teammate_context(drone)
         centroid_xy = self._auto_centroid_for_drone(drone)
         common = dict(
             robot_index=drone['drone_index'],
@@ -1160,6 +1575,9 @@ class Simulator:
             centroid_xy=centroid_xy,
             teammate_positions=teammate_positions,
             teammate_goal_positions=teammate_goal_positions,
+            own_recent_path=self._recent_estimated_path(drone),
+            teammate_path_histories=teammate_path_histories,
+            partition_penalty_scale=self._partition_penalty_scale(),
         )
         if self.auto_policy == 'weighted_coverage':
             return self.coverage_controller.choose_goal(
@@ -1199,6 +1617,15 @@ class Simulator:
                 return True
         return False
 
+    def _remaining_frontier_mass(self):
+        total = 0
+        for comp in self.frontier_components:
+            if isinstance(comp, dict):
+                total += int(comp.get('size', len(comp.get('cells', comp.get('points', [])))))
+            else:
+                total += int(len(comp))
+        return total
+
     def _auto_explore_done_now(self):
         if self.mission_mode != 'auto_explore':
             return False
@@ -1215,83 +1642,76 @@ class Simulator:
                 return False
         if len(self.frontier_components) <= 0:
             return True
+        if self._remaining_frontier_mass() <= int(AUTO_FINISH_MIN_TOTAL_FRONTIER_CELLS):
+            return True
         return not self._any_assignable_frontier_goal()
 
     def _maybe_finish_auto_explore(self):
         if not self.auto_mode or self.mission_mode != 'auto_explore' or not AUTO_STOP_WHEN_FINISHED:
             self.auto_finish_candidate_time = None
+            self.return_finish_candidate_time = None
             return
-        if not self._auto_explore_done_now():
-            self.auto_finish_candidate_time = None
+        if not self.return_phase_active:
+            if not self._auto_explore_done_now():
+                self.auto_finish_candidate_time = None
+                return
+            if self.auto_finish_candidate_time is None:
+                self.auto_finish_candidate_time = self.time_elapsed
+                return
+            if (self.time_elapsed - self.auto_finish_candidate_time) < float(AUTO_FINISH_HOLD_SECONDS):
+                return
+            self._begin_return_phase()
             return
-        if self.auto_finish_candidate_time is None:
-            self.auto_finish_candidate_time = self.time_elapsed
+        if not self._all_robots_home_and_idle():
+            self.return_finish_candidate_time = None
             return
-        if (self.time_elapsed - self.auto_finish_candidate_time) < float(AUTO_FINISH_HOLD_SECONDS):
+        if self.return_finish_candidate_time is None:
+            self.return_finish_candidate_time = self.time_elapsed
+            return
+        if (self.time_elapsed - self.return_finish_candidate_time) < float(RETURN_HOME_FINISH_HOLD_SECONDS):
             return
         self.auto_mode = False
         self.auto_finished = True
         self.auto_finish_candidate_time = None
+        self.return_finish_candidate_time = None
         for drone in self.drones:
             drone['robot'].set_motor_speeds(0.0, 0.0)
+            drone['auto_phase'] = 'returned'
+            drone['team_role'] = 'home'
         self._refresh_toggle_button()
         self._refresh_control_text()
-        self._log_event('auto_finished', 'Automatic exploration reached completion condition')
+        self._log_event('auto_finished', 'Exploration and return-to-home completed')
         self._finalize_current_run()
 
     def _choose_launch_staging_goal(self, drone):
         if not AUTO_LAUNCH_DISPERSAL_ENABLED:
             return None
-        idx = int(drone.get('drone_index', 0))
-        start_x, start_y, start_angle = self._start_pose_for_index(idx, len(self.drones))
-        ref = None
-        if idx < len(self.partition_centroids_xy):
-            cand = np.asarray(self.partition_centroids_xy[idx], dtype=float)
-            if np.all(np.isfinite(cand)):
-                ref = cand
-        if ref is None and idx < len(self.partition_generators_xy):
-            cand = np.asarray(self.partition_generators_xy[idx], dtype=float)
-            if np.all(np.isfinite(cand)):
-                ref = cand
-        if ref is None:
-            ang = math.radians(start_angle)
-            ref = np.array([start_x + math.cos(ang), start_y + math.sin(ang)], dtype=float)
-
-        direction = np.asarray(ref, dtype=float) - np.array([start_x, start_y], dtype=float)
-        norm = float(np.linalg.norm(direction))
-        if norm < 1e-9:
-            ang = math.radians(start_angle)
-            direction = np.array([math.cos(ang), math.sin(ang)], dtype=float)
-            norm = 1.0
-        direction = direction / norm
-
-        planning_occ = self._planning_occupancy(self.shared_known_grid)
+        start_x, start_y, start_heading = self._start_pose_for_index(int(drone.get('drone_index', 0)), max(1, len(self.drones)))
+        heading = math.radians(start_heading)
+        planning_occ = self._planning_occupancy(self.shared_known_grid, exclude_drone=drone)
         x_est, y_est, _ = drone['odometry'].mu
-        nominal = max(float(AUTO_LAUNCH_DISPERSAL_DISTANCE), 1.4 * A_STAR_GOAL_TOLERANCE)
-        distances = [nominal, 0.86 * nominal, 0.72 * nominal, 0.58 * nominal, 0.44 * nominal]
-        tried = []
-        for dist in distances:
-            cand_xy = np.array([start_x, start_y], dtype=float) + direction * dist
-            cand_xy[0] = float(np.clip(cand_xy[0], 0.8, WORLD_WIDTH_METERS - 0.8))
-            cand_xy[1] = float(np.clip(cand_xy[1], 0.8, WORLD_HEIGHT_METERS - 0.8))
-            tried.append(tuple(cand_xy))
-
-        if ref is not None:
-            tried.append((float(np.clip(ref[0], 0.8, WORLD_WIDTH_METERS - 0.8)), float(np.clip(ref[1], 0.8, WORLD_HEIGHT_METERS - 0.8))))
-
+        nominal = max(float(HOME_BASE_STAGING_DISTANCE), float(AUTO_LAUNCH_DISPERSAL_DISTANCE), 1.4 * A_STAR_GOAL_TOLERANCE)
+        candidate_xy = []
+        for dist_scale in (1.0, 0.85, 0.7):
+            dist = nominal * dist_scale
+            for ang_offset in (0.0, -0.18, 0.18, -0.36, 0.36):
+                ang = heading + ang_offset
+                cand = np.array([start_x + dist * math.cos(ang), start_y + dist * math.sin(ang)], dtype=float)
+                cand[0] = float(np.clip(cand[0], 0.8, WORLD_WIDTH_METERS - 0.8))
+                cand[1] = float(np.clip(cand[1], 0.8, WORLD_HEIGHT_METERS - 0.8))
+                candidate_xy.append((float(cand[0]), float(cand[1])))
         seen = set()
-        for cand in tried:
+        for cand in candidate_xy:
             if cand in seen:
                 continue
             seen.add(cand)
-            cell = self.planner.nearest_free_cell(self._world_to_grid(*cand), planning_occ)
+            cell = self.planner.nearest_free_cell(self._world_to_grid(*cand), planning_occ, clearance_cells=A_STAR_GOAL_CLEARANCE_CELLS)
             goal_xy = self._grid_to_world(cell)
-            if math.hypot(goal_xy[0] - start_x, goal_xy[1] - start_y) < 1.1 * A_STAR_GOAL_TOLERANCE:
+            if math.hypot(goal_xy[0] - x_est, goal_xy[1] - y_est) < 1.25 * A_STAR_GOAL_TOLERANCE:
                 continue
-            if self._line_crosses_blocked((x_est, y_est), goal_xy, planning_occ):
-                path = self._astar((x_est, y_est), goal_xy, self.shared_known_grid)
-                if not path:
-                    continue
+            path = self._astar((x_est, y_est), goal_xy, self.shared_known_grid, exclude_drone=drone)
+            if not path:
+                continue
             return goal_xy
         return None
 
@@ -1315,7 +1735,20 @@ class Simulator:
         if not immediate_reassign and not periodic_review:
             return
 
-        if drone.get('auto_phase', 'launch') == 'launch':
+        phase = drone.get('auto_phase', 'launch')
+        if phase == 'returned':
+            drone['auto_goal_xy'] = None
+            drone['path'] = []
+            return
+        if phase == 'return':
+            return_goal = self._home_return_goal_for_drone(drone)
+            if self._should_keep_current_auto_goal(drone, return_goal, {'goal_flavor': 'return-home'}):
+                return
+            self._assign_auto_goal(drone, return_goal, meta={'goal_flavor': 'return-home'})
+            drone['team_role'] = 'return'
+            return
+
+        if phase == 'launch':
             stage_goal = self._choose_launch_staging_goal(drone)
             if stage_goal is not None:
                 if self._should_keep_current_auto_goal(drone, stage_goal, None):
@@ -1329,8 +1762,9 @@ class Simulator:
             return
         self._assign_auto_goal(drone, goal_xy, meta=meta)
 
-    def _astar(self, start_xy, goal_xy, known_grid):
-        return self.planner.astar(start_xy, goal_xy, known_grid, OCCUPIED)
+    def _astar(self, start_xy, goal_xy, known_grid, exclude_drone=None):
+        planning_occ = self._planning_occupancy(known_grid, exclude_drone=exclude_drone)
+        return self.planner.astar_on_occupancy(start_xy, goal_xy, planning_occ, goal_clearance_cells=A_STAR_GOAL_CLEARANCE_CELLS)
 
     def _line_crosses_blocked(self, p0, p1, planning_occ=None, sample_step=None):
         planning_occ = self.truth_occupancy if planning_occ is None else planning_occ
@@ -1374,7 +1808,7 @@ class Simulator:
         y1 = min(self.ny - 1, cy + window)
 
         known = self.shared_known_grid
-        planning_occ = self._planning_occupancy(known)
+        planning_occ = self._planning_occupancy(known, exclude_drone=drone)
         path_cells = {self._world_to_grid(px, py) for px, py in drone.get('planned_path', [])}
         color = drone['color']
 
@@ -1439,9 +1873,19 @@ class Simulator:
             start_pose=start_pose,
             robot_seed_rng=np.random.default_rng(self._seed_for_drone(drone_index, stream=1)),
             planner_init_known_grid=self._init_known_grid,
+            planner_world_to_grid=self._world_to_grid,
         )
         drone['rng'] = np.random.default_rng(self._seed_for_drone(drone_index, stream=2))
         drone['min_clearance'] = self.view_distance
+        drone['local_logodds_grid'], drone['local_confidence_grid'] = self._init_belief_layers(drone['local_known_grid'])
+        drone['local_pose_uncertainty_grid'] = self._init_pose_uncertainty_grid(drone['local_known_grid'])
+        drone['recent_scan_buffer'] = deque(maxlen=MAP_SCAN_BUFFER_SIZE)
+        drone['last_pose_trace'] = float(np.trace(drone['odometry'].cov[:2, :2]))
+        drone['teammate_memory'] = {}
+        drone['visible_teammates'] = []
+        drone['visible_segments_est'] = []
+        drone['local_uncertainty_rgba_cache'] = np.zeros((self.ny, self.nx, 4), dtype=float)
+        drone['local_uncertainty_dirty'] = True
         return drone
 
     def robot_shape_from_pose(self, x, y, angle_deg, size):
@@ -1465,9 +1909,8 @@ class Simulator:
         except Exception:
             self.ui.seed_box.set_val(str(self.current_seed))
             return
-        self._finalize_current_run()
         self._load_environment(seed)
-        self._start_new_run()
+        self._prepare_for_new_run()
         self.auto_mode = False
         self._refresh_toggle_button()
         self._refresh_control_text()
@@ -1477,11 +1920,13 @@ class Simulator:
             drone['path'] = list(new_path) if self.mission_mode == 'manual_click' else []
             drone['auto_goal_xy'] = None
             drone['auto_goal_last_set_time'] = -1e9
+            drone['auto_goal_meta'] = None
             drone['auto_phase'] = 'launch'
+            drone['team_role'] = 'launch'
         self.reset_simulation()
-        self._saved_current_run = False
         self._mark_partition_dirty()
         self._refresh_partition_state(force=True)
+        self._update_los_and_packets()
         self.ui.refresh_shared_map()
 
     def toggle_auto_mode(self, event=None):
@@ -1489,6 +1934,8 @@ class Simulator:
         if self.auto_mode:
             self.auto_finished = False
             self.auto_finish_candidate_time = None
+            self.return_phase_active = False
+            self.return_finish_candidate_time = None
         self._refresh_toggle_button()
         self._refresh_control_text()
         self._mark_partition_dirty()
@@ -1499,6 +1946,7 @@ class Simulator:
                 drone['auto_goal_last_set_time'] = -1e9
                 drone['auto_goal_meta'] = None
                 drone['auto_phase'] = 'launch'
+                drone['team_role'] = 'launch'
                 drone['path'] = []
                 drone['planned_path'] = []
                 drone['plan_goal_index'] = -1
@@ -1518,7 +1966,11 @@ class Simulator:
         self.time_elapsed = 0.0
         self.ui.seed_box.set_val(str(self.current_seed))
         self.shared_known_grid = self._init_known_grid()
+        self.shared_logodds_grid, self.shared_confidence_grid = self._init_belief_layers(self.shared_known_grid)
+        self.shared_pose_uncertainty_grid = self._init_pose_uncertainty_grid(self.shared_known_grid)
+        self._mark_shared_uncertainty_dirty()
         self.shared_known_landmarks = {}
+        self._ui_frame_counter = 0
 
         for idx, drone in enumerate(self.drones):
             start_x, start_y, start_angle = self._start_pose_for_index(idx, len(self.drones))
@@ -1552,12 +2004,16 @@ class Simulator:
                 drone['subgoal_marker'].set_data([], [])
                 drone['target_marker'].set_data([], [])
             drone['local_known_grid'] = self._init_known_grid()
-            self._reveal_start_area(drone['local_known_grid'], start_x, start_y)
-            self._reveal_start_area(self.shared_known_grid, start_x, start_y)
+            drone['local_logodds_grid'], drone['local_confidence_grid'] = self._init_belief_layers(drone['local_known_grid'])
+            drone['local_pose_uncertainty_grid'] = self._init_pose_uncertainty_grid(drone['local_known_grid'])
+            self._mark_local_uncertainty_dirty(drone)
+            drone['recent_scan_buffer'] = deque(maxlen=MAP_SCAN_BUFFER_SIZE)
+            self._reveal_start_area_with_belief(drone['local_known_grid'], drone['local_logodds_grid'], drone['local_confidence_grid'], drone['local_pose_uncertainty_grid'], start_x, start_y)
+            self._reveal_start_area_with_belief(self.shared_known_grid, self.shared_logodds_grid, self.shared_confidence_grid, self.shared_pose_uncertainty_grid, start_x, start_y)
             drone['known_occ_count'] = int(np.count_nonzero(self.shared_known_grid == OCCUPIED))
             drone['local_known_occ_count'] = int(np.count_nonzero(drone['local_known_grid'] == OCCUPIED))
             drone['just_discovered_obstacle'] = False
-            drone['recent_positions'] = [(0.0, start_x, start_y)]
+            drone['recent_positions'] = [(0.0, *self._estimated_xy(drone))]
             drone['recovery_until'] = -1e9
             drone['recovery_turn_sign'] = 1.0
             drone['last_scan_bias'] = 1.0
@@ -1574,7 +2030,11 @@ class Simulator:
             drone['distance_travelled'] = 0.0
             drone['idle_time'] = 0.0
             drone['last_goal_type'] = 'none'
-            drone['visited_cells'] = {self._world_to_grid(start_x, start_y)}
+            drone['visited_cells'] = {self._estimated_grid_cell(drone)}
+            drone['last_pose_trace'] = float(np.trace(drone['odometry'].cov[:2, :2]))
+            drone['teammate_memory'] = {}
+            drone['visible_teammates'] = []
+            drone['visible_segments_est'] = []
 
             drone['trace_x'] = [start_x]
             drone['trace_y'] = [start_y]
@@ -1593,27 +2053,68 @@ class Simulator:
                 line.set_data([start_x, start_x], [start_y, start_y])
             self._update_mission_artist(drone)
 
-        self._saved_current_run = False
         self._mark_partition_dirty()
         self._refresh_partition_state(force=True)
+        self._update_los_and_packets()
         self.ui.refresh_shared_map()
         self._record_coverage_snapshot(force=True)
         self._log_event('run_reset', 'Simulation reset to initial conditions', seed=int(self.current_seed))
 
-    def _apply_scan_to_grid(self, grid, robot, scan):
+    def _apply_scan_to_grid(self, grid, logodds_grid, confidence_grid, pose_uncertainty_grid, robot, scan, pose_cov):
         return apply_scan_to_grid(
-            grid, robot, scan, self._world_to_grid, self._stamp_obstacle_hit, self.grid_resolution, self.view_distance, UNKNOWN, FREE
+            grid,
+            logodds_grid,
+            confidence_grid,
+            pose_uncertainty_grid,
+            robot,
+            scan,
+            self._world_to_grid,
+            self._stamp_obstacle_hit,
+            self.grid_resolution,
+            self.view_distance,
+            UNKNOWN,
+            FREE,
+            OCCUPIED,
+            pose_cov,
         )
 
     def _update_known_map_from_scan(self, drone, scan):
         changed = update_known_map_from_scan(
-            drone, self.shared_known_grid, scan, self._apply_scan_to_grid, OCCUPIED
+            drone,
+            self.shared_known_grid,
+            self.shared_logodds_grid,
+            self.shared_confidence_grid,
+            self.shared_pose_uncertainty_grid,
+            scan,
+            self._apply_scan_to_grid,
+            OCCUPIED,
         )
         if changed:
+            self._invalidate_planning_cache()
+            self._mark_local_uncertainty_dirty(drone)
+            self._mark_shared_uncertainty_dirty()
             self._mark_partition_dirty()
 
     def _clearance_groups(self, scan):
         return clearance_groups(scan)
+
+    def _path_blocked(self, drone, planning_occ, max_segments=8):
+        path = list(drone.get('planned_path', []))
+        if len(path) < 2:
+            return False
+        prog = max(0, min(int(drone.get('path_progress_index', 0)), len(path) - 1))
+        x_est, y_est, _ = drone['odometry'].mu
+        prev = (float(x_est), float(y_est))
+        checked = 0
+        for pt in path[prog:]:
+            seg_end = (float(pt[0]), float(pt[1]))
+            if self._line_crosses_blocked(prev, seg_end, planning_occ):
+                return True
+            prev = seg_end
+            checked += 1
+            if checked >= max_segments:
+                break
+        return False
 
     def _maybe_replan(self, drone):
         path = drone['path']
@@ -1627,20 +2128,21 @@ class Simulator:
 
         x_est, y_est, _ = drone['odometry'].mu
         goal = path[target_idx]
-        planning_occ = self._planning_occupancy(self.shared_known_grid)
+        planning_occ = self._planning_occupancy(self.shared_known_grid, exclude_drone=drone)
         plan_age = float(self.time_elapsed - drone['last_plan_time'])
         goal_changed = drone['plan_goal_index'] != target_idx
         missing_path = not drone['planned_path']
 
         goal_gx, goal_gy = self._world_to_grid(*goal)
         goal_blocked = bool(planning_occ[goal_gy, goal_gx])
-        allow_blocked_refresh = goal_blocked and plan_age >= max(A_STAR_MIN_REPLAN_GAP_SECONDS, 1.5)
+        path_blocked = self._path_blocked(drone, planning_occ) if KNOWN_MAP_REPLAN_ON_NEW_OBS else False
+        allow_blocked_refresh = (goal_blocked or path_blocked) and plan_age >= max(A_STAR_MIN_REPLAN_GAP_SECONDS, 1.5)
 
         need_replan = goal_changed or missing_path or allow_blocked_refresh
 
         if need_replan:
             old_path = list(drone['planned_path'])
-            new_path = self._astar((x_est, y_est), goal, self.shared_known_grid)
+            new_path = self._astar((x_est, y_est), goal, self.shared_known_grid, exclude_drone=drone)
             drone['plan_goal_index'] = target_idx
             drone['last_plan_time'] = self.time_elapsed
             drone['replan_count'] = int(drone.get('replan_count', 0)) + 1
@@ -1654,6 +2156,8 @@ class Simulator:
                     reason = 'goal update'
                 elif goal_blocked:
                     reason = 'goal blocked'
+                elif path_blocked:
+                    reason = 'path blocked'
                 else:
                     reason = 'path refresh'
                 if (not old_path) or abs(new_len - old_len) > 0.75 or drone['replan_count'] in (1, 5, 10):
@@ -1679,25 +2183,34 @@ class Simulator:
             return None
         x_est, y_est, _ = drone['odometry'].mu
         prog = drone['path_progress_index']
-        planning_occ = self._planning_occupancy(self.shared_known_grid)
+        planning_occ = self._planning_occupancy(self.shared_known_grid, exclude_drone=drone)
 
         while prog < len(path_pts) - 1 and math.hypot(path_pts[prog][0] - x_est, path_pts[prog][1] - y_est) < A_STAR_GOAL_TOLERANCE:
             prog += 1
 
-        furthest_visible = prog
+        visible_candidates = []
         max_idx = min(len(path_pts) - 1, prog + max(1, A_STAR_LOOKAHEAD_STEPS))
         for j in range(prog, max_idx + 1):
             if self._line_crosses_blocked((x_est, y_est), path_pts[j], planning_occ):
                 break
-            furthest_visible = j
+            clearance_m = self.planner.clearance_distance_world(path_pts[j], planning_occ)
+            visible_candidates.append((j, clearance_m, path_pts[j]))
 
         drone['path_progress_index'] = prog
-        return path_pts[furthest_visible]
+        if not visible_candidates:
+            return None
+
+        safe_candidates = [item for item in visible_candidates if item[1] >= float(SUBGOAL_OBSTACLE_CLEARANCE_METERS)]
+        if safe_candidates:
+            safe_candidates.sort(key=lambda item: (item[0] + SUBGOAL_CLEARANCE_PREFERENCE * item[1], item[1]), reverse=True)
+            return safe_candidates[0][2]
+
+        visible_candidates.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        return visible_candidates[0][2]
 
     def _update_progress_history(self, drone):
-        robot = drone['robot']
         hist = drone['recent_positions']
-        hist.append((self.time_elapsed, robot.x, robot.y))
+        hist.append((self.time_elapsed, *self._estimated_xy(drone)))
         cutoff = self.time_elapsed - STUCK_WINDOW_SECONDS
         while len(hist) > 2 and hist[1][0] < cutoff:
             hist.pop(0)
@@ -1707,7 +2220,8 @@ class Simulator:
             return False
         if not drone['last_command_active']:
             return False
-        if drone['min_clearance'] > max(1.0, 0.95 * OBSTACLE_AVOID_DISTANCE):
+        emergency_clearance = max(0.55, 1.25 * (float(drone['robot'].size) / 2.0))
+        if drone['min_clearance'] > emergency_clearance:
             return False
         hist = drone['recent_positions']
         if len(hist) < 2:
@@ -1735,6 +2249,7 @@ class Simulator:
 
         scan = robot.scan_obstacles(self.obstacles, self.fov_angle, self.view_distance, ray_count=VISION_RAY_COUNT)
         self._update_known_map_from_scan(drone, scan)
+        self._record_recent_scan(drone, robot, scan)
         left, center, right = self._clearance_groups(scan)
         min_center = float(np.min(center)) if len(center) else self.view_distance
         mean_left = float(np.mean(left)) if len(left) else self.view_distance
@@ -1775,14 +2290,24 @@ class Simulator:
         dist_goal = math.hypot(goal_x - x_est, goal_y - y_est)
         dist_sub = math.hypot(sg_x - x_est, sg_y - y_est)
 
-        goal_tol = AUTO_LAUNCH_DISPERSAL_GOAL_TOLERANCE if (self.mission_mode == 'auto_explore' and drone.get('auto_phase', 'explore') == 'launch') else A_STAR_GOAL_TOLERANCE
+        if self.mission_mode == 'auto_explore' and drone.get('auto_phase', 'explore') == 'launch':
+            goal_tol = AUTO_LAUNCH_DISPERSAL_GOAL_TOLERANCE
+        elif self.mission_mode == 'auto_explore' and drone.get('auto_phase', 'explore') == 'return':
+            goal_tol = RETURN_HOME_GOAL_TOLERANCE
+        else:
+            goal_tol = A_STAR_GOAL_TOLERANCE
 
         if dist_goal < goal_tol:
             drone['goal_reached_count'] = int(drone.get('goal_reached_count', 0)) + 1
             if self.mission_mode == 'auto_explore':
                 reached_goal = drone.get('auto_goal_xy')
-                if drone.get('auto_phase', 'explore') == 'launch':
+                phase = drone.get('auto_phase', 'explore')
+                if phase == 'launch':
                     drone['auto_phase'] = 'explore'
+                    drone['team_role'] = 'explorer'
+                elif phase == 'return':
+                    drone['auto_phase'] = 'returned'
+                    drone['team_role'] = 'home'
                 drone['auto_goal_xy'] = None
                 drone['auto_goal_last_set_time'] = self.time_elapsed
                 drone['path'] = []
@@ -1792,7 +2317,9 @@ class Simulator:
                 drone['planned_path'] = []
                 drone['plan_line'].set_data([], [])
                 if reached_goal is not None:
-                    self._log_event('goal_reached', f"Reached {drone.get('last_goal_type', 'goal')} at ({reached_goal[0]:.2f}, {reached_goal[1]:.2f})", drone=drone)
+                    event_name = 'returned_home' if phase == 'return' else 'goal_reached'
+                    label = 'home base' if phase == 'return' else drone.get('last_goal_type', 'goal')
+                    self._log_event(event_name, f"Reached {label} at ({reached_goal[0]:.2f}, {reached_goal[1]:.2f})", drone=drone)
             else:
                 reached_goal = path[target_idx] if target_idx < len(path) else None
                 drone['current_target_index'] += 1
@@ -1815,12 +2342,28 @@ class Simulator:
         v = (1.0 if dist_sub > 0.35 else 0.55) * heading_scale
         omega = np.clip(angle_diff / 4.2, -3.2, 3.2)
 
-        if min_center < 0.9:
-            v *= 0.15
-            turn_sign = 1.0 if mean_left >= mean_right else -1.0
-            omega = turn_sign * max(abs(omega), OBSTACLE_TURN_GAIN)
-        elif min_center < OBSTACLE_AVOID_DISTANCE:
-            v *= max(0.35, min_center / max(OBSTACLE_AVOID_DISTANCE, 1e-6))
+        # Let A* and clearance-aware goal/subgoal selection handle obstacle avoidance.
+        # The controller only slows or stops on immediate collision risk instead of
+        # creating a long-range reactive "soft wall" around obstacles.
+        emergency_clearance = max(0.55, 1.25 * (float(robot.size) / 2.0))
+        caution_clearance = max(0.8, emergency_clearance + 0.25)
+        if min_center < emergency_clearance:
+            v = 0.0
+        elif min_center < caution_clearance:
+            v *= max(0.45, min_center / max(caution_clearance, 1e-6))
+
+        for other in self.drones:
+            if other is drone:
+                continue
+            ox = float(other['robot'].x) - float(robot.x)
+            oy = float(other['robot'].y) - float(robot.y)
+            dist = math.hypot(ox, oy)
+            if dist < 1e-6 or dist > ROBOT_AVOIDANCE_RADIUS:
+                continue
+            rel_angle = self._wrap_angle_deg(math.degrees(math.atan2(oy, ox)) - theta_est)
+            if abs(rel_angle) <= 95.0:
+                v *= max(0.15, dist / max(ROBOT_AVOIDANCE_RADIUS, 1e-6))
+                omega += -math.copysign(ROBOT_AVOIDANCE_GAIN * (1.0 - dist / max(ROBOT_AVOIDANCE_RADIUS, 1e-6)), rel_angle)
 
         drone['last_command_active'] = abs(v) > 0.05 or abs(omega) > 0.1
         drone['subgoal_marker'].set_data([sg_x], [sg_y])
@@ -1843,9 +2386,10 @@ class Simulator:
         if dt > 0.0:
             prev_x = float(robot.x)
             prev_y = float(robot.y)
-            robot.update(dt, obstacles=self.obstacles)
+            other_robots = [other['robot'] for other in self.drones if other is not drone]
+            robot.update(dt, obstacles=self.obstacles, other_robots=other_robots)
             drone['distance_travelled'] = float(drone.get('distance_travelled', 0.0)) + math.hypot(float(robot.x) - prev_x, float(robot.y) - prev_y)
-            drone.setdefault('visited_cells', set()).add(self._world_to_grid(robot.x, robot.y))
+            drone.setdefault('visited_cells', set()).add(self._estimated_grid_cell(drone))
             if not drone.get('last_command_active', False):
                 drone['idle_time'] = float(drone.get('idle_time', 0.0)) + float(dt)
             self._update_progress_history(drone)
@@ -1881,7 +2425,14 @@ class Simulator:
                 landmark_total=len(self.shared_known_landmarks),
             )
         measurements = []
+        home_base_measurement = self._home_base_measurement(drone)
+        if home_base_measurement is not None:
+            measurements.append(home_base_measurement)
+
+        home_marker_key = self._landmark_key(self._home_marker())
         for lm in detected:
+            if self._landmark_key(lm) == home_marker_key:
+                continue
             dx = lm.x - robot.x
             dy = lm.y - robot.y
             r = np.hypot(dx, dy) + drone['rng'].normal(0.0, MEASUREMENT_NOISE[0])
@@ -1892,14 +2443,28 @@ class Simulator:
             b = true_bearing + drone['rng'].normal(0.0, MEASUREMENT_NOISE[1])
             measurements.append((r, b, lm.x, lm.y))
 
-        if dt > 0.0 and measurements:
-            odometry.correct(
-                measurements,
-                np.diag([MEASUREMENT_NOISE[0] ** 2, MEASUREMENT_NOISE[1] ** 2]),
-                alpha=MEASUREMENT_ALPHA,
-            )
-            drone['measurement_update_count'] = int(drone.get('measurement_update_count', 0)) + 1
-            drone['last_landmark_update_time'] = float(self.time_elapsed)
+        teammate_measurements = self._interrobot_measurements(drone)
+        if dt > 0.0 and (measurements or teammate_measurements):
+            pre_correct_mu = np.array(odometry.mu, dtype=float)
+            pre_correct_cov = np.array(odometry.cov, dtype=float)
+            if measurements:
+                odometry.correct(
+                    measurements,
+                    np.diag([MEASUREMENT_NOISE[0] ** 2, MEASUREMENT_NOISE[1] ** 2]),
+                    alpha=MEASUREMENT_ALPHA,
+                )
+                drone['measurement_update_count'] = int(drone.get('measurement_update_count', 0)) + len(measurements)
+                drone['last_landmark_update_time'] = float(self.time_elapsed)
+            for teammate_meas, teammate_R, teammate_alpha, _teammate_name in teammate_measurements:
+                odometry.correct_with_uncertain_landmarks([teammate_meas], teammate_R, alpha=teammate_alpha)
+                drone['measurement_update_count'] = int(drone.get('measurement_update_count', 0)) + 1
+            if ENABLE_RECENT_SCAN_REPLAY and self._should_replay_recent_scans(pre_correct_mu, pre_correct_cov, odometry.mu, odometry.cov):
+                delta_pose = (
+                    float(odometry.mu[0] - pre_correct_mu[0]),
+                    float(odometry.mu[1] - pre_correct_mu[1]),
+                    self._wrap_angle_deg(float(odometry.mu[2] - pre_correct_mu[2])),
+                )
+                self._replay_recent_scans(drone, delta_pose)
 
         est_x, est_y, est_theta = odometry.mu
         drone['true_patch'].set_xy(self.robot_shape_from_pose(robot.x, robot.y, robot.angle, robot.size))
@@ -1911,11 +2476,12 @@ class Simulator:
         return detected
 
     def update(self, frame):
+        if isinstance(getattr(self, '_planning_occ_cache_frame', None), dict):
+            self._planning_occ_cache_frame.clear()
         dt = TIME_STEP if self.auto_mode else 0.0
         if dt > 0.0:
             self.time_elapsed += dt
-            self._saved_current_run = False
-
+    
         self._refresh_partition_state(force=False)
         artists = []
 
@@ -1946,6 +2512,7 @@ class Simulator:
             ])
             artists.extend(drone['ray_lines'])
 
+        self._update_los_and_packets()
         if dt > 0.0:
             self.trace_counter += 1
             self._mark_partition_dirty()
@@ -1954,10 +2521,18 @@ class Simulator:
         if dt > 0.0 and self.auto_mode:
             self._maybe_print_live_snapshot(force=False)
         self._maybe_finish_auto_explore()
+        self._ui_frame_counter = int(getattr(self, '_ui_frame_counter', 0)) + 1
+        shared_refresh = (not self.auto_mode) or (self._ui_frame_counter % max(1, int(UI_SHARED_REFRESH_EVERY_FRAMES)) == 0)
+        heavy_refresh = (not self.auto_mode) or (self._ui_frame_counter % max(1, int(UI_HEAVY_REFRESH_EVERY_FRAMES)) == 0)
+        overlay_refresh = (not self.auto_mode) or (self._ui_frame_counter % max(1, int(UI_OVERLAY_REFRESH_EVERY_FRAMES)) == 0)
+        monitor_refresh = (not self.auto_mode) or (self._ui_frame_counter % max(1, int(UI_MONITOR_REFRESH_EVERY_FRAMES)) == 0)
         self.ui.refresh_status_text()
-        self._saved_current_run = False
-        self.ui.refresh_shared_map()
-        self.ui.refresh_partition_overlay()
+        if shared_refresh:
+            self.ui.refresh_shared_map()
+        if heavy_refresh and overlay_refresh:
+            self.ui.refresh_partition_overlay()
+        if heavy_refresh and monitor_refresh:
+            self.ui.refresh_robot_monitor()
         artists.append(self.ui.status_text)
         if self.ui.shared_map_image is not None:
             artists.append(self.ui.shared_map_image)
@@ -1980,7 +2555,6 @@ class Simulator:
             cache_frame_data=False,
         )
         plt.show()
-        self._save_outputs()
 
 if __name__ == '__main__':
     Simulator().run()
