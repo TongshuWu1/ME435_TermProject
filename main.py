@@ -1,10 +1,10 @@
-# main.py
+from src.simulator import Simulator
 
-from src.simulation import Simulator
 
-def main():
+def main() -> None:
     sim = Simulator()
     sim.run()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

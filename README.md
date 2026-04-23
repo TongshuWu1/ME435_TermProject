@@ -1,59 +1,65 @@
-# ME435 Term Project
+# ME435 Rewrite Baseline
 
-## Project layout
-- `main.py` — entry point
-- `config.py` — simulation constants
-- `src/` — source code
-- `outputs/` — saved run folders with PNG, CSV, and JSON summaries
+A cleaner baseline for decentralized multi-robot exploration.
 
-## Source structure
-Top-level modules:
-- `src/simulation.py` — main simulator loop and high-level coordination
-- `src/auto_explore.py` — frontier selection logic
-- `src/planner.py` — occupancy-grid helpers and A* planning
-- `src/mapping_utils.py` — map update helpers
-- `src/environment.py` — obstacle and landmark generation
-- `src/output_utils.py` — saved trajectory and map figures
-- `src/reporting.py` — human-readable run summaries, CSV reports, and coverage progress plots
-- `src/paths.py` — project-root and output-folder helpers
-- `src/robot.py` — robot motion, collision checks, landmark detection, and obstacle scans
-- `src/localization.py` — EKF state estimator
-- `src/landmark.py` — landmark model
+## What this version does
 
-Refactored subpackages:
-- `src/ui/simulator_ui.py` — Matplotlib canvas, buttons, selectors, and shared-map panel
-- `src/sim/rendering.py` — reusable robot / FOV / covariance ellipse rendering helpers
-- `src/sim/drone_factory.py` — drone creation and artist setup
-- `src/sim/partition_state.py` — cached partition / density overlay generation
-- `src/controllers/frontier_controller.py` — frontier-goal controller wrapper
-- `src/controllers/coverage_controller.py` — weighted Voronoi / centroid coverage controller
+- 2D world with exact rectangle obstacles, fixed landmarks, and a permanent home marker
+- explicit **home base** in the bottom-left corner that also acts as a trusted localization marker
+- continuous robot collision against true obstacle geometry
+- per-robot local occupancy maps built only from that robot's LiDAR
+- no shared mapping
+- lightweight teammate packets relayed through the current communication graph
+- landmark-based EKF-style localization updates from fixed landmarks and the home marker
+- teammate-assisted cooperative localization using received teammate mean/covariance as uncertain mobile references
+- decentralized frontier exploration with teammate-trace avoidance
+- **phase 1 navigation hardening**
+  - larger planner clearance
+  - no diagonal corner cutting in A*
+  - exact-geometry path compression checks
+  - blocked / stuck detection with waypoint skipping and forced replanning
+- **phase 2 LOS communication graph**
+  - robot-to-robot links require line of sight and communication range
+  - home-base links require LOS to the home region and communication range
+  - multi-hop connectivity is tracked every step
+  - robots only receive teammate packets from their reachable communication component
+- additional speed work:
+  - faster grid indexing in mapping
+  - cached planner inflation offsets
+  - one-shot reachable-set computation for frontier scoring instead of repeated trial planning
+- GUI with:
+  - global truth panel
+  - one local-map panel per robot
+  - own path/target overlays
+  - received teammate paths / positions / targets
+  - LOS robot links and home links on the global panel
+  - local cards showing whether each robot is home-connected
+- control bar with:
+  - Start
+  - Stop
+  - Reset
+  - Seed
+  - Robot count
+  - Obstacle count
+  - Landmark count
+  - ray toggle
 
-Compatibility shim:
-- `src/sim_ui.py` — imports `SimulatorUI` from `src/ui/simulator_ui.py`
+## What this version intentionally leaves simple
 
-## Mission modes
-1. **Manual Click**
-   - click to add waypoints for the selected robot
-   - use `Set Start` to move a robot's launch position
+- localization is still intentionally lightweight rather than a full multi-robot SLAM backend
+- no role-switch logic yet
+- no return-home mission logic yet
 
-2. **Auto Explore**
-   - robots automatically build the shared map
-   - frontiers are detected from the shared known map
-   - a Voronoi-style partition is computed from the robots' estimated positions
-   - you can switch between **Frontier** and **Weighted Coverage** auto policies
-   - the weighted-coverage policy now favors reachable, high-information pockets in each robot's region, penalizes revisiting already-worked cells, and uses the partition centroid only as a soft fallback
-   - A* is still used to route to that goal
+This is still a baseline, but it is now a more reliable baseline for the next research layers.
 
-## UI notes
-- `Mission Mode` switches between manual waypointing and automatic exploration.
-- `Auto Policy` switches the exploration controller between classic frontier goals and weighted Voronoi coverage.
-- `Start / Pause` controls the simulation.
-- `Show / Hide Region` toggles the partition overlay.
-- `Show / Hide Density` toggles the density overlay.
-- The top-right status block is now clipped inside its own panel so it no longer covers the main canvas.
-- The small map on the right is the shared explored map.
+## Run
+
+```bash
+python main.py
+```
 
 ## Notes
-- The simulator starts paused.
-- Each run saves a folder under `outputs/` containing trajectory/map PNGs plus `run_summary.txt`, `run_summary.json`, `robot_summary.csv`, `coverage_timeline.csv`, and `event_timeline.csv`.
-- Robot count is determined by `DRONE_NAMES` in `config.py`.
+
+- The simulation starts **paused** by default.
+- Changing the text-box values takes effect when you press **Reset**.
+- Reset regenerates the world and robot roster from the current controls.

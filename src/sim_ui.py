@@ -1,3 +1,0 @@
-from .ui.simulator_ui import AUTO_POLICY_LABELS, EDIT_MODE_LABELS, MISSION_MODE_LABELS, SimulatorUI
-
-__all__ = ['AUTO_POLICY_LABELS', 'EDIT_MODE_LABELS', 'MISSION_MODE_LABELS', 'SimulatorUI']
